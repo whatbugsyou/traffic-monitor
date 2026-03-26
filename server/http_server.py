@@ -19,9 +19,11 @@ from urllib.parse import urlparse
 
 # 配置
 PORT = 8080
-DATA_DIR = "/root/traffic-monitor/data"
-DB_PATH = "/root/traffic-monitor/data/traffic_monitor.db"
-WEB_ROOT = "/root/traffic-monitor/web"
+# 自动检测项目根目录
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+DB_PATH = os.path.join(DATA_DIR, "traffic_monitor.db")
+WEB_ROOT = os.path.join(PROJECT_ROOT, "web")
 
 # 聚合间隔配置
 INTERVAL_10S = 10  # 10秒

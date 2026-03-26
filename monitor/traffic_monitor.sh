@@ -4,7 +4,9 @@
 # 通过读取 /sys/class/net/ 文件系统获取网络接口数据
 
 REFRESH_INTERVAL=1
-DATA_DIR="/root/traffic-monitor/data"
+# 自动检测项目根目录
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DATA_DIR="$PROJECT_DIR/data"
 DATA_FILE="$DATA_DIR/traffic_data.json"
 DB_PATH="$DATA_DIR/traffic_monitor.db"
 NETNS_DIR="/var/run/netns"

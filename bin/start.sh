@@ -3,7 +3,7 @@
 # 监控脚本会自动获取所有命名空间（通过读取 /var/run/netns/ 目录）
 
 # 项目根目录
-PROJECT_DIR="/root/traffic-monitor"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="$PROJECT_DIR/server"
 MONITOR_DIR="$PROJECT_DIR/monitor"
 LOG_DIR="$PROJECT_DIR/logs"
