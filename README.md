@@ -5,12 +5,14 @@
 ## 功能特性
 
 - ✅ 实时流量监控（每秒采样）
+- ✅ **自动获取所有命名空间**（读取 `/var/run/netns/` 目录）
 - ✅ 多 network namespace 并发采集
+- ✅ **数据保留 3 小时**（每个命名空间 10800 条记录）
 - ✅ SQLite 数据库存储（按命名空间自动清理旧数据）
 - ✅ SSE 实时推送（服务器主动推送，支持 `?namespace=` 过滤）
 - ✅ 前后端分离：后端暴露 REST API，前端为独立静态页面
 - ✅ 前端支持输入服务器地址连接，动态切换命名空间
-- ✅ ECharts 可视化图表（各网卡流量折线图）
+- ✅ ECharts 可视化图表（支持大数据量降采样渲染）
 - ✅ PPP0 接口丢包统计
 - ✅ 增量数据传输（减少网络流量）
 - ✅ 自动重连机制
@@ -26,7 +28,7 @@ traffic-monitor/
 │   ├── http_server.py         # HTTP 服务器（REST API + SSE）
 │   └── init_db.py             # 数据库初始化 / 迁移
 ├── monitor/
-│   └── traffic_monitor.sh     # 流量采集脚本（支持多命名空间）
+│   └── traffic_monitor.sh     # 流量采集脚本（自动获取所有命名空间）
 ├── web/
 │   └── index.html             # 独立前端页面（可本地打开）
 ├── logs/
@@ -45,12 +47,13 @@ traffic-monitor/
 服务器端                          客户端（任意浏览器）
 ─────────────────────────         ──────────────────────────
 traffic_monitor.sh                web/index.html（本地文件）
-  ├─ default namespace               ├─ 输入服务器地址
-  ├─ serverSpace namespace    ──▶    ├─ 获取命名空间列表
-  └─ vpnSpace namespace              ├─ 选择命名空间
-        │                            └─ SSE 实时接收数据
+  │ 自动读取 /var/run/netns/         ├─ 输入服务器地址
+  ├─ default namespace               ├─ 获取命名空间列表
+  ├─ serverSpace namespace    ──▶    ├─ 选择命名空间
+  └─ vpnSpace namespace              └─ SSE 实时接收数据
+        │
         ▼
-  traffic_monitor.db
+  traffic_monitor.db（保留3小时）
         │
         ▼
   http_server.py :8080
@@ -60,38 +63,41 @@ traffic_monitor.sh                web/index.html（本地文件）
     /api/stream?namespace=
 ```
 
+## 数据量预估
+
+| 参数 | 数值 |
+|------|------|
+| 命名空间数 | 300（预估） |
+| 采样间隔 | 1 秒 |
+| 数据保留时间 | 3 小时 = 10800 秒 |
+| 每条记录大小 | ~400 字节（JSON） |
+
+**总数据量**：
+- 记录数：300 × 10800 = **3,240,000 条**
+- 数据库大小：3,240,000 × 400 ≈ **1.3 GB**
+
+**单个命名空间首次加载**：
+- 记录数：10800 条
+- 数据量：10800 × 400 ≈ **4.3 MB**
+
+> 注：前端通过 SSE 增量传输，首次加载后仅传输新数据，大幅减少网络流量。
+
 ## 快速开始
 
 ### 服务器端部署
 
-**1. 仅监控默认命名空间**
-
 ```bash
+# 启动服务（自动监控所有命名空间）
 /root/traffic-monitor/bin/start.sh start
-```
 
-**2. 监控多个命名空间**
-
-```bash
-/root/traffic-monitor/bin/start.sh --namespaces default,serverSpace,vpnSpace start
-```
-
-**3. 停止服务**
-
-```bash
+# 停止服务
 /root/traffic-monitor/bin/start.sh stop
-```
 
-**4. 查看状态**
-
-```bash
+# 查看状态
 /root/traffic-monitor/bin/start.sh status
-```
 
-**5. 重启服务**
-
-```bash
-/root/traffic-monitor/bin/start.sh stop && /root/traffic-monitor/bin/start.sh --namespaces default,serverSpace start
+# 重启服务
+/root/traffic-monitor/bin/start.sh stop && /root/traffic-monitor/bin/start.sh start
 ```
 
 ### 客户端（前端）使用
@@ -105,6 +111,22 @@ traffic_monitor.sh                web/index.html（本地文件）
 5. 实时查看流量图表
 
 > 服务器地址会自动保存到 `localStorage`，刷新页面后无需重新输入。
+
+## 命名空间自动发现
+
+监控脚本启动时会自动获取所有网络命名空间：
+
+1. **默认命名空间**：始终监控，标记为 `default`
+2. **其他命名空间**：通过读取 `/var/run/netns/` 目录获取
+
+```
+/var/run/netns/
+├── serverSpace    → 自动发现并监控
+├── vpnSpace       → 自动发现并监控
+└── clientSpace    → 自动发现并监控
+```
+
+> 无需手动指定命名空间列表，新增命名空间后重启服务即可自动纳入监控。
 
 ## API 文档
 
@@ -180,38 +202,6 @@ es.onmessage = (event) => {
 data: {"type":"incremental","data":[...]}
 ```
 
-## 命令行参数说明
-
-### traffic_monitor.sh
-
-```
-用法: traffic_monitor.sh [--namespaces <ns1,ns2,...>]
-
-选项:
-  --namespaces   指定要采集的命名空间，逗号分隔（默认: default）
-                 "default" 表示当前默认命名空间（不执行 ip netns exec）
-                 其他命名空间通过 ip netns exec <ns> 执行
-
-示例:
-  ./traffic_monitor.sh
-  ./traffic_monitor.sh --namespaces default,serverSpace,vpnSpace
-```
-
-### start.sh
-
-```
-用法: start.sh [--namespaces <ns1,ns2,...>] {start|stop|status|restart}
-
-选项:
-  --namespaces <ns1,ns2,...>   指定要监控的命名空间（逗号分隔）
-
-示例:
-  ./start.sh start
-  ./start.sh --namespaces default,serverSpace start
-  ./start.sh stop
-  ./start.sh status
-```
-
 ## 数据库说明
 
 使用 SQLite，表结构如下：
@@ -228,19 +218,29 @@ CREATE TABLE traffic_history (
 );
 ```
 
-- 每个命名空间各自保留最近 **300 条**记录（约 5 分钟），超出自动清理最旧记录
+- 每个命名空间各自保留最近 **10800 条**记录（约 3 小时），超出自动清理最旧记录
 - 首次运行会自动初始化；已有旧版数据库（无 `namespace` 列）会自动迁移，原数据归入 `default` 命名空间
+
+### 手动清理旧数据
+
+```bash
+# 清理超过 3 小时的数据（默认）
+python3 /root/traffic-monitor/server/init_db.py cleanup
+
+# 清理超过指定小时数的数据
+python3 /root/traffic-monitor/server/init_db.py cleanup 6
+```
 
 ## 技术栈
 
 | 层级 | 技术 |
 |------|------|
-| 采集 | Bash + `/sys/class/net` + `ifconfig` |
+| 采集 | Bash + `/sys/class/net` + `/var/run/netns/` |
 | 后端 | Python 3.6 标准库（`http.server`、`sqlite3`、`socketserver`） |
 | 数据库 | SQLite |
 | 推送协议 | SSE（Server-Sent Events） |
 | 前端 | 原生 HTML/CSS/JavaScript |
-| 图表 | ECharts 5.4.3（BootCDN） |
+| 图表 | ECharts 5.4.3（支持大数据量降采样） |
 
 ## 故障排查
 
@@ -267,6 +267,9 @@ tail -f /root/traffic-monitor/logs/monitor.log
 # 确认命名空间存在
 ip netns list
 
+# 确认 /var/run/netns/ 目录
+ls -la /var/run/netns/
+
 # 手动测试采集
 ip netns exec serverSpace ip link show
 
@@ -282,8 +285,23 @@ ip netns exec serverSpace ip link show
 python3 /root/traffic-monitor/server/init_db.py
 ```
 
+## 性能优化
+
+### 前端大数据量渲染
+
+前端图表支持以下优化：
+
+1. **降采样渲染**：ECharts 配置 `sampling: 'lttb'`，使用 Largest-Triangle-Three-Buckets 算法
+2. **大数据模式**：配置 `large: true`，启用 ECharts 大数据优化
+3. **X 轴标签间隔**：每 10 分钟显示一个时间标签，避免重叠
+
+### 后端数据清理
+
+数据库触发器自动清理超过 10800 条的旧数据，避免数据库无限增长。
+
 ## 版本历史
 
+- **v3.1**：自动获取所有命名空间，数据保留时间改为 3 小时，前端支持大数据量渲染
 - **v3.0**：前后端分离重构，多命名空间支持，数据库增加 namespace 字段
 - **v2.0**：迁移到 SSE，项目结构重组
 - **v1.5**：迁移到 SQLite 数据库

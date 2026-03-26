@@ -517,7 +517,9 @@
         let lossChart = null;
         const lossData = {labels: [], rxLoss: [], txLoss: []};
         let historyData = [];
-        const MAX_DATA_POINTS = 300;
+        // 数据保留时间：3 小时 = 3 * 60 * 60 = 10800 条记录
+        // 前端保留完整数据点，ECharts 通过 sampling 配置优化渲染
+        const MAX_DATA_POINTS = 10800;
 
         /* ═══════════════════════════════════════════
            DOM refs
@@ -619,7 +621,8 @@
                     type: 'category',
                     boundaryGap: false,
                     data: [],
-                    axisLabel: {interval: 29, rotate: 0}
+                    // 3小时约10800个点，每600个点(10分钟)显示一个标签
+                    axisLabel: {interval: 599, rotate: 0}
                 },
                 yAxis: {
                     type: 'value',
@@ -628,6 +631,10 @@
                 series: [
                     {
                         name: '下载', type: 'line', smooth: true, data: [],
+                        // 大数据量优化：启用降采样
+                        sampling: 'lttb',
+                        large: true,
+                        largeThreshold: 1000,
                         itemStyle: {color: '#3b82f6'},
                         areaStyle: {
                             color: {
@@ -641,6 +648,9 @@
                     },
                     {
                         name: '上传', type: 'line', smooth: true, data: [],
+                        sampling: 'lttb',
+                        large: true,
+                        largeThreshold: 1000,
                         itemStyle: {color: '#10b981'},
                         areaStyle: {
                             color: {
@@ -671,15 +681,28 @@
                     type: 'category',
                     boundaryGap: false,
                     data: [],
-                    axisLabel: {interval: 29, rotate: 0}
+                    // 3小时约10800个点，每600个点(10分钟)显示一个标签
+                    axisLabel: {interval: 599, rotate: 0}
                 },
                 yAxis: {
                     type: 'value',
                     axisLabel: {formatter: (v) => v + ' 包'}
                 },
                 series: [
-                    {name: 'RX丢包', type: 'line', smooth: true, data: [], itemStyle: {color: '#3b82f6'}},
-                    {name: 'TX丢包', type: 'line', smooth: true, data: [], itemStyle: {color: '#10b981'}}
+                    {
+                        name: 'RX丢包', type: 'line', smooth: true, data: [],
+                        sampling: 'lttb',
+                        large: true,
+                        largeThreshold: 1000,
+                        itemStyle: {color: '#3b82f6'}
+                    },
+                    {
+                        name: 'TX丢包', type: 'line', smooth: true, data: [],
+                        sampling: 'lttb',
+                        large: true,
+                        largeThreshold: 1000,
+                        itemStyle: {color: '#10b981'}
+                    }
                 ]
             });
         }

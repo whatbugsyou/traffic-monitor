@@ -3,6 +3,7 @@
 """
 SQLite 数据库初始化脚本
 用于流量监控数据存储
+- 数据保留时间：3 小时（每个命名空间 10800 条记录）
 """
 
 import os
@@ -10,6 +11,10 @@ import sqlite3
 
 # 数据库配置
 DB_PATH = "/root/traffic-monitor/data/traffic_monitor.db"
+
+# 数据保留配置
+# 采样间隔 1 秒，3 小时 = 3 * 60 * 60 = 10800 条记录
+RECORDS_PER_NAMESPACE = 10800
 
 
 def migrate_database():
@@ -52,7 +57,7 @@ def migrate_database():
         for idx_name in old_indexes:
             # 跳过自动生成的主键索引
             if not idx_name.startswith("sqlite_"):
-                cursor.execute(f'DROP INDEX IF EXISTS "{idx_name}"')
+                cursor.execute('DROP INDEX IF EXISTS "{}"'.format(idx_name))
 
         # 旧表的 UNIQUE(timestamp_ms) 约束内嵌在表定义中，无法直接删除列约束，
         # 需要重建表以去除旧约束并添加新的组合唯一约束
@@ -96,6 +101,7 @@ def init_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
+    # 创建表
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS traffic_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,18 +114,25 @@ def init_database():
         )
     """)
 
+    # 创建索引
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_namespace_timestamp_ms
         ON traffic_history(namespace, timestamp_ms)
     """)
 
-    cursor.execute("""
+    # 删除旧的触发器（如果存在）
+    cursor.execute("DROP TRIGGER IF EXISTS auto_cleanup")
+
+    # 创建自动清理触发器
+    # 每个命名空间保留最近 10800 条记录（3小时）
+    cursor.execute(
+        """
         CREATE TRIGGER IF NOT EXISTS auto_cleanup
         AFTER INSERT ON traffic_history
         WHEN (
             SELECT COUNT(*) FROM traffic_history
             WHERE namespace = NEW.namespace
-        ) > 300
+        ) > %d
         BEGIN
             DELETE FROM traffic_history
             WHERE id = (
@@ -129,21 +142,26 @@ def init_database():
                 LIMIT 1
             );
         END
-    """)
+    """
+        % RECORDS_PER_NAMESPACE
+    )
 
     conn.commit()
     conn.close()
 
-    print(f"✓ 数据库初始化完成: {DB_PATH}")
+    print("✓ 数据库初始化完成: %s" % DB_PATH)
     print("✓ 表结构已创建（含 namespace 字段）")
     print("✓ 索引已创建（namespace, timestamp_ms）")
-    print("✓ 自动清理触发器已创建（每个命名空间各自保留最近 300 条记录）")
+    print(
+        "✓ 自动清理触发器已创建（每个命名空间保留最近 %d 条记录，约 %.1f 小时）"
+        % (RECORDS_PER_NAMESPACE, RECORDS_PER_NAMESPACE / 3600.0)
+    )
 
 
 def check_database():
     """检查数据库状态"""
     if not os.path.exists(DB_PATH):
-        print(f"数据库文件不存在: {DB_PATH}")
+        print("数据库文件不存在: %s" % DB_PATH)
         return
 
     conn = sqlite3.connect(DB_PATH)
@@ -168,20 +186,67 @@ def check_database():
     conn.close()
 
     print("\n=== 数据库状态 ===")
-    print(f"数据库路径: {DB_PATH}")
-    print(f"数据库大小: {db_size / 1024:.2f} KB")
-    print(f"记录总数量: {total_count} 条")
+    print("数据库路径: %s" % DB_PATH)
+    print("数据库大小: %.2f KB" % (db_size / 1024.0))
+    print("记录总数量: %d 条" % total_count)
     if time_range[0] and time_range[1]:
-        print(f"时间范围: {time_range[0]} ~ {time_range[1]}")
+        print("时间范围: %s ~ %s" % (time_range[0], time_range[1]))
 
     if ns_counts:
         print("\n各命名空间记录数：")
         for ns, cnt in ns_counts:
-            print(f"  [{ns}]: {cnt} 条")
+            hours = cnt / 3600.0
+            print("  [%s]: %d 条（约 %.1f 小时）" % (ns, cnt, hours))
     else:
         print("\n暂无记录")
 
 
+def cleanup_old_data(hours=3):
+    """手动清理超过指定小时数的旧数据"""
+    if not os.path.exists(DB_PATH):
+        print("数据库文件不存在: %s" % DB_PATH)
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # 计算截止时间戳（毫秒）
+    import time
+
+    cutoff_ms = int(time.time() * 1000) - (hours * 3600 * 1000)
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) FROM traffic_history
+        WHERE timestamp_ms < ?
+    """,
+        (cutoff_ms,),
+    )
+    old_count = cursor.fetchone()[0]
+
+    if old_count > 0:
+        cursor.execute(
+            """
+            DELETE FROM traffic_history
+            WHERE timestamp_ms < ?
+        """,
+            (cutoff_ms,),
+        )
+        conn.commit()
+        print("✓ 已清理 %d 条超过 %d 小时的旧数据" % (old_count, hours))
+    else:
+        print("没有需要清理的旧数据")
+
+    conn.close()
+
+
 if __name__ == "__main__":
-    init_database()
-    check_database()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "cleanup":
+        # 手动清理旧数据
+        hours = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+        cleanup_old_data(hours)
+    else:
+        init_database()
+        check_database()

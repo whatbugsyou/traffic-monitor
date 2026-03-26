@@ -1,5 +1,6 @@
 #!/bin/bash
 # 流量监控系统 - 统一启动脚本
+# 监控脚本会自动获取所有命名空间（通过读取 /var/run/netns/ 目录）
 
 # 项目根目录
 PROJECT_DIR="/root/traffic-monitor"
@@ -14,9 +15,6 @@ HTTP_SERVER="$SERVER_DIR/http_server.py"
 MONITOR_SCRIPT="$MONITOR_DIR/traffic_monitor.sh"
 INIT_DB="$SERVER_DIR/init_db.py"
 
-# 默认参数
-NAMESPACES="default"
-
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -29,25 +27,23 @@ NC='\033[0m'
 show_help() {
     echo "流量监控系统启动脚本"
     echo
-    echo "用法: $0 [选项] {start|stop|status|restart}"
-    echo
-    echo "选项:"
-    echo "  --namespaces <ns1,ns2,...>  指定要监控的命名空间（逗号分隔）"
-    echo "                             默认: default（当前默认命名空间）"
-    echo "                             示例: default,serverSpace,vpnSpace"
+    echo "用法: $0 {start|stop|status|restart}"
     echo
     echo "子命令:"
-    echo "  start    启动所有服务"
+    echo "  start    启动所有服务（自动监控所有命名空间）"
     echo "  stop     停止所有服务"
     echo "  status   查看服务状态"
     echo "  restart  重启所有服务"
     echo "  -h       显示帮助信息"
     echo
+    echo "说明:"
+    echo "  监控脚本会自动读取 /var/run/netns/ 目录获取所有命名空间"
+    echo "  包括默认命名空间（default）和所有已创建的网络命名空间"
+    echo
     echo "示例:"
-    echo "  $0 start                                    # 仅监控默认命名空间"
-    echo "  $0 --namespaces default,serverSpace start   # 监控多个命名空间"
-    echo "  $0 stop                                     # 停止服务"
-    echo "  $0 status                                   # 查看状态"
+    echo "  $0 start    # 启动服务（自动监控所有命名空间）"
+    echo "  $0 stop     # 停止服务"
+    echo "  $0 status   # 查看状态"
 }
 
 # 解析命令行参数
@@ -55,14 +51,6 @@ parse_args() {
     COMMAND=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --namespaces)
-                NAMESPACES="$2"
-                shift 2
-                ;;
-            --namespaces=*)
-                NAMESPACES="${1#*=}"
-                shift
-                ;;
             start|stop|status|restart)
                 COMMAND="$1"
                 shift
@@ -99,7 +87,7 @@ start_services() {
     echo -e "${BLUE}========================================${NC}"
     echo -e "${BLUE}启动流量监控系统${NC}"
     echo -e "${BLUE}========================================${NC}"
-    echo -e "${CYAN}监控命名空间: ${NAMESPACES}${NC}"
+    echo -e "${CYAN}命名空间: 自动获取所有命名空间${NC}"
     echo
 
     # 检查监控服务是否已在运行
@@ -125,11 +113,10 @@ start_services() {
     create_dirs
     init_database
 
-    # 启动流量监控服务（附带命名空间参数）
+    # 启动流量监控服务（自动获取所有命名空间）
     echo -e "${BLUE}启动流量监控服务...${NC}"
     chmod +x "$MONITOR_SCRIPT"
-    nohup "$MONITOR_SCRIPT" --namespaces "$NAMESPACES" \
-        > "$LOG_DIR/monitor.log" 2>&1 &
+    nohup "$MONITOR_SCRIPT" > "$LOG_DIR/monitor.log" 2>&1 &
     local monitor_pid=$!
     echo "$monitor_pid" > "$PID_DIR/monitor.pid"
     echo -e "${GREEN}✓ 流量监控服务已启动 (PID: $monitor_pid)${NC}"
@@ -139,8 +126,7 @@ start_services() {
 
     # 启动 HTTP 服务器
     echo -e "${BLUE}启动 HTTP 服务器...${NC}"
-    nohup python3 "$HTTP_SERVER" \
-        > "$LOG_DIR/http_server.log" 2>&1 &
+    nohup python3 "$HTTP_SERVER" > "$LOG_DIR/http_server.log" 2>&1 &
     local http_pid=$!
     echo "$http_pid" > "$PID_DIR/http_server.pid"
     echo -e "${GREEN}✓ HTTP 服务器已启动 (PID: $http_pid)${NC}"
@@ -151,6 +137,8 @@ start_services() {
     echo -e "${GREEN}========================================${NC}"
     echo
     echo -e "${CYAN}后端 API 地址: http://<服务器IP>:8080${NC}"
+    echo -e "${CYAN}数据保留时间: 3 小时${NC}"
+    echo
     echo -e "${CYAN}API 端点:${NC}"
     echo -e "${CYAN}  GET /api/namespaces              - 命名空间列表${NC}"
     echo -e "${CYAN}  GET /api/current?namespace=<ns>  - 当前数据${NC}"
@@ -275,7 +263,8 @@ rows = conn.execute(
 ).fetchall()
 conn.close()
 for ns, cnt in rows:
-    print("    %-20s %d 条" % (ns, cnt))
+    hours = cnt / 3600.0
+    print("    %-20s %d 条（约 %.1f 小时）" % (ns, cnt, hours))
 PY
 )
         if [ -n "$ns_counts" ]; then
