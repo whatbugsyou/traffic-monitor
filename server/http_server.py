@@ -79,15 +79,82 @@ def get_history_by_duration(namespace, duration_minutes):
                 (namespace, since_ms),
             )
             rows = cursor.fetchall()
+            conn.close()
+
             result = []
+            prev_data = None
+
             for row in rows:
                 try:
                     data = json.loads(row[0])
                     data["resolution"] = "1s"
+
+                    # 计算速度（从上一次数据）
+                    if prev_data is not None:
+                        interval_ms = data.get("timestamp_ms", 0) - prev_data.get(
+                            "timestamp_ms", 0
+                        )
+                        if interval_ms > 0:
+                            for iface in data.get("interfaces", []):
+                                iface_name = iface.get("name")
+                                # 查找上一次的同名接口
+                                prev_iface = None
+                                for pi in prev_data.get("interfaces", []):
+                                    if pi.get("name") == iface_name:
+                                        prev_iface = pi
+                                        break
+
+                                if prev_iface:
+                                    # 计算速度（字节/秒）
+                                    rx_speed = max(
+                                        0,
+                                        int(
+                                            (
+                                                iface.get("rx_bytes", 0)
+                                                - prev_iface.get("rx_bytes", 0)
+                                            )
+                                            * 1000
+                                            / interval_ms
+                                        ),
+                                    )
+                                    tx_speed = max(
+                                        0,
+                                        int(
+                                            (
+                                                iface.get("tx_bytes", 0)
+                                                - prev_iface.get("tx_bytes", 0)
+                                            )
+                                            * 1000
+                                            / interval_ms
+                                        ),
+                                    )
+                                    iface["rx_speed"] = rx_speed
+                                    iface["tx_speed"] = tx_speed
+
+                    # 计算丢包增量（从上一次数据）
+                    if prev_data is not None:
+                        if data.get("ppp0", {}).get("available") and prev_data.get(
+                            "ppp0", {}
+                        ).get("available"):
+                            rx_dropped_inc = max(
+                                0,
+                                data["ppp0"].get("rx_dropped", 0)
+                                - prev_data["ppp0"].get("rx_dropped", 0),
+                            )
+                            tx_dropped_inc = max(
+                                0,
+                                data["ppp0"].get("tx_dropped", 0)
+                                - prev_data["ppp0"].get("tx_dropped", 0),
+                            )
+                            data["ppp0"]["rx_dropped_inc"] = rx_dropped_inc
+                            data["ppp0"]["tx_dropped_inc"] = tx_dropped_inc
+
                     result.append(data)
+                    prev_data = data
+
                 except (json.JSONDecodeError, KeyError):
                     continue
-            conn.close()
+
             return result
 
         elif duration_minutes <= 60:
@@ -519,11 +586,32 @@ class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response({"error": str(e)}, 500)
 
     def handle_sse_stream(self):
-        """处理SSE流请求，支持 ?namespace= 参数"""
+        """
+        处理SSE流请求
+        支持 ?namespace= 和 ?duration= 参数
+        根据 duration 选择不同粒度的数据表进行推送
+        """
         try:
             parsed_path = urlparse(self.path)
             params = parse_query_params(parsed_path.query)
             namespace = params.get("namespace", "default")
+            duration_str = params.get("duration", "5")
+            duration_minutes = int(duration_str) if duration_str.isdigit() else 5
+            duration_minutes = max(5, min(180, duration_minutes))
+
+            # 根据 duration 决定查询哪个表和推送间隔
+            if duration_minutes <= 5:
+                table = "traffic_history"
+                push_interval = 1  # 1秒
+                resolution = "1s"
+            elif duration_minutes <= 60:
+                table = "traffic_history_10s"
+                push_interval = 10  # 10秒
+                resolution = "10s"
+            else:
+                table = "traffic_history_1m"
+                push_interval = 60  # 60秒
+                resolution = "1m"
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -533,30 +621,83 @@ class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
             last_timestamp = 0
-            print("[SSE] 客户端连接建立，namespace=%s" % namespace)
+            print(
+                "[SSE] 客户端连接建立，namespace=%s，duration=%d分钟，resolution=%s"
+                % (namespace, duration_minutes, resolution)
+            )
 
             while True:
                 try:
                     if os.path.exists(DB_PATH):
                         conn = sqlite3.connect(DB_PATH)
                         cursor = conn.cursor()
-                        cursor.execute(
-                            "SELECT data FROM traffic_history"
-                            " WHERE namespace = ? AND timestamp_ms > ?"
-                            " ORDER BY timestamp_ms ASC",
-                            (namespace, last_timestamp),
-                        )
-                        rows = cursor.fetchall()
-                        conn.close()
 
-                        if rows:
-                            new_data = [json.loads(row[0]) for row in rows]
-                            last_timestamp = new_data[-1]["timestamp_ms"]
+                        if table == "traffic_history":
+                            # 原始数据表
+                            cursor.execute(
+                                "SELECT data FROM %s"
+                                " WHERE namespace = ? AND timestamp_ms > ?"
+                                " ORDER BY timestamp_ms ASC" % table,
+                                (namespace, last_timestamp),
+                            )
+                            rows = cursor.fetchall()
+                            conn.close()
 
+                            if rows:
+                                new_data = [json.loads(row[0]) for row in rows]
+                                last_timestamp = new_data[-1]["timestamp_ms"]
+                                # 添加分辨率标记
+                                for d in new_data:
+                                    d["resolution"] = "1s"
+                            else:
+                                new_data = []
+                        else:
+                            # 聚合数据表
+                            cursor.execute(
+                                "SELECT namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,"
+                                "       rx_dropped_sum, tx_dropped_sum"
+                                " FROM %s"
+                                " WHERE namespace = ? AND timestamp_ms > ?"
+                                " ORDER BY timestamp_ms ASC" % table,
+                                (namespace, last_timestamp),
+                            )
+                            rows = cursor.fetchall()
+                            conn.close()
+
+                            if rows:
+                                new_data = []
+                                for (
+                                    ns,
+                                    ts,
+                                    ts_ms,
+                                    rx_speed,
+                                    tx_speed,
+                                    rx_drop,
+                                    tx_drop,
+                                ) in rows:
+                                    new_data.append(
+                                        {
+                                            "namespace": ns,
+                                            "timestamp": ts,
+                                            "timestamp_ms": ts_ms,
+                                            "interfaces": [],
+                                            "rx_speed_avg": rx_speed,
+                                            "tx_speed_avg": tx_speed,
+                                            "rx_dropped_sum": rx_drop,
+                                            "tx_dropped_sum": tx_drop,
+                                            "resolution": resolution,
+                                        }
+                                    )
+                                last_timestamp = new_data[-1]["timestamp_ms"]
+                            else:
+                                new_data = []
+
+                        if new_data:
                             message = json.dumps(
                                 {
                                     "type": "incremental",
                                     "data": new_data,
+                                    "resolution": resolution,
                                     "timestamp": time.time(),
                                 },
                                 ensure_ascii=False,
@@ -565,14 +706,14 @@ class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
                             self.wfile.write(("data: %s\n\n" % message).encode("utf-8"))
                             self.wfile.flush()
 
-                    time.sleep(1)
+                    time.sleep(push_interval)
 
                 except (BrokenPipeError, ConnectionResetError):
                     print("[SSE] 客户端断开连接，namespace=%s" % namespace)
                     break
                 except Exception as e:
                     print("[SSE] 推送异常 (namespace=%s): %s" % (namespace, str(e)))
-                    time.sleep(1)
+                    time.sleep(push_interval)
 
         except Exception as e:
             print("[SSE] SSE流处理异常: %s" % str(e))

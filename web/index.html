@@ -813,7 +813,6 @@
 
             let totalRxSpeed = 0;
             let totalTxSpeed = 0;
-            let prevData = null;
 
             // 判断是否为聚合数据
             if (isAggregated || (historyData.length > 0 && historyData[0].rx_speed_avg !== undefined)) {
@@ -851,20 +850,14 @@
                 historyData.forEach((data, index) => {
                     const isLast = index === historyData.length - 1;
                     const time = new Date(data.timestamp).toLocaleTimeString();
-                    const intervalMs = prevData ? (data.timestamp_ms - prevData.timestamp_ms) : 1000;
 
                     (data.interfaces || []).forEach(iface => {
                         const name = iface.name;
                         createInterfaceChart(name);
 
-                        let rxSpeed = 0, txSpeed = 0;
-                        if (prevData) {
-                            const prevIface = (prevData.interfaces || []).find(i => i.name === name);
-                            if (prevIface) {
-                                rxSpeed = calcSpeed(iface.rx_bytes, prevIface.rx_bytes, intervalMs);
-                                txSpeed = calcSpeed(iface.tx_bytes, prevIface.tx_bytes, intervalMs);
-                            }
-                        }
+                        // 直接使用服务端计算的速度
+                        const rxSpeed = iface.rx_speed || 0;
+                        const txSpeed = iface.tx_speed || 0;
 
                         interfaceData[name].labels.push(time);
                         interfaceData[name].rx.push((rxSpeed / 1024).toFixed(2));
@@ -876,15 +869,13 @@
                         }
                     });
 
-                    if (data.ppp0 && data.ppp0.available && prevData && prevData.ppp0 && prevData.ppp0.available) {
-                        const rxLoss = Math.max(0, data.ppp0.rx_dropped - prevData.ppp0.rx_dropped);
-                        const txLoss = Math.max(0, data.ppp0.tx_dropped - prevData.ppp0.tx_dropped);
+                    // 丢包数据（使用服务端计算的增量）
+                    if (data.ppp0 && data.ppp0.available && data.ppp0.rx_dropped_inc !== undefined) {
+                        const time = new Date(data.timestamp).toLocaleTimeString();
                         lossData.labels.push(time);
-                        lossData.rxLoss.push(rxLoss);
-                        lossData.txLoss.push(txLoss);
+                        lossData.rxLoss.push(data.ppp0.rx_dropped_inc);
+                        lossData.txLoss.push(data.ppp0.tx_dropped_inc);
                     }
-
-                    prevData = data;
                 });
             }
 
@@ -990,11 +981,11 @@
             }
         }
 
-        // SSE 连接（仅用于实时数据，5分钟范围时使用）
-        function connectSSE(ns) {
+        // SSE 连接（根据时间范围推送不同粒度的数据）
+        function connectSSE(ns, duration) {
             disconnectSSE();
 
-            const url = `${baseUrl}/api/stream?namespace=${encodeURIComponent(ns)}`;
+            const url = `${baseUrl}/api/stream?namespace=${encodeURIComponent(ns)}&duration=${duration}`;
             console.log('[SSE] 连接:', url);
 
             try {
@@ -1002,21 +993,21 @@
 
                 eventSource.onopen = () => {
                     console.log('[SSE] 已连接');
-                    setStatus('connected', `已连接 · ${ns}`);
+                    setStatus('connected', `已连接 · ${ns} · ${formatDuration(duration)}`);
                 };
 
                 eventSource.onmessage = (event) => {
                     try {
                         const msg = JSON.parse(event.data);
-                        if (msg.type === 'incremental' && currentDuration <= 5) {
-                            // 只有在5分钟范围内才实时更新
+                        if (msg.type === 'incremental') {
                             const newData = msg.data || [];
                             if (newData.length > 0) {
                                 // 增量更新
                                 historyData = historyData.concat(newData);
-                                // 保持最近300条
-                                if (historyData.length > 300) {
-                                    historyData = historyData.slice(-300);
+                                // 根据时间范围保持适量的数据点
+                                const maxPoints = duration <= 5 ? 300 : duration <= 60 ? 360 : 180;
+                                if (historyData.length > maxPoints) {
+                                    historyData = historyData.slice(-maxPoints);
                                 }
                                 processHistoryData(historyData, false);
                             }
@@ -1047,13 +1038,8 @@
             // 加载历史数据
             await loadHistoryData(ns, currentDuration);
 
-            // 如果是5分钟范围，建立SSE实时连接
-            if (currentDuration <= 5) {
-                connectSSE(ns);
-            } else {
-                disconnectSSE();
-                setStatus('connected', `已连接 · ${ns} · ${formatDuration(currentDuration)}`);
-            }
+            // 建立SSE实时连接（所有时间范围都推送，按粒度推送）
+            connectSSE(ns, currentDuration);
         }
 
         async function switchDuration(duration) {
@@ -1063,13 +1049,8 @@
             if (currentNs) {
                 await loadHistoryData(currentNs, duration);
 
-                // 如果是5分钟范围，建立SSE实时连接
-                if (duration <= 5) {
-                    connectSSE(currentNs);
-                } else {
-                    disconnectSSE();
-                    setStatus('connected', `已连接 · ${currentNs} · ${formatDuration(duration)}`);
-                }
+                // 建立SSE实时连接（所有时间范围都推送，按粒度推送）
+                connectSSE(currentNs, duration);
             }
         }
 
