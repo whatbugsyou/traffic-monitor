@@ -1,0 +1,22 @@
+# 数据文件
+data/
+*.db
+*.json
+
+# 日志文件
+logs/
+*.log
+
+# PID 文件
+*.pid
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 备份
+backups/
