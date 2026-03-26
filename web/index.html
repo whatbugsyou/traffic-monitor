@@ -200,6 +200,16 @@
             font-weight: 600;
         }
 
+        .resolution-badge {
+            display: inline-block;
+            background: #f3f4f6;
+            color: #6b7280;
+            border-radius: 12px;
+            padding: 1px 8px;
+            font-size: 12px;
+            margin-left: 6px;
+        }
+
         /* ── 统计卡片 ── */
         .stats-grid {
             display: grid;
@@ -408,13 +418,23 @@
                 <select id="ns-select" disabled>
                     <option value="">— 请先连接 —</option>
                 </select>
+                <label for="duration-select">时间范围</label>
+                <select id="duration-select" disabled>
+                    <option value="5">5 分钟</option>
+                    <option value="10">10 分钟</option>
+                    <option value="15">15 分钟</option>
+                    <option value="30">30 分钟</option>
+                    <option value="60">1 小时</option>
+                    <option value="120">2 小时</option>
+                    <option value="180">3 小时</option>
+                </select>
                 <button class="btn-connect" id="btn-connect">连接</button>
                 <div class="connect-status">
                     <span class="status-dot" id="status-dot"></span>
                     <span id="status-text">未连接</span>
                 </div>
             </div>
-            <div class="connect-hint" id="connect-hint">输入后端服务器地址，点击「连接」开始监控</div>
+            <div class="connect-hint" id="connect-hint">输入后端服务器地址，点击「连接」开始监控。时间范围越大，数据粒度越粗。</div>
         </div>
 
         <!-- ── 标题栏（连接后显示） ── -->
@@ -424,6 +444,11 @@
                 <div class="info-item">
                     <strong>命名空间：</strong>
                     <span class="ns-badge" id="current-ns-label">—</span>
+                </div>
+                <div class="info-item">
+                    <strong>时间范围：</strong>
+                    <span id="duration-label">5 分钟</span>
+                    <span class="resolution-badge" id="resolution-label">(1秒/点)</span>
                 </div>
                 <div class="info-item">
                     <strong>最后更新：</strong>
@@ -517,18 +542,23 @@
         let lossChart = null;
         const lossData = {labels: [], rxLoss: [], txLoss: []};
         let historyData = [];
-        // 数据保留时间：3 小时 = 3 * 60 * 60 = 10800 条记录
-        // 前端保留完整数据点，ECharts 通过 sampling 配置优化渲染
-        const MAX_DATA_POINTS = 10800;
+        // 当前选择的时间范围（分钟）
+        let currentDuration = 5;
+        // 当前数据分辨率
+        let currentResolution = '1s';
 
         /* ═══════════════════════════════════════════
            DOM refs
         ═══════════════════════════════════════════ */
         const $serverUrl = document.getElementById('server-url');
         const $nsSelect = document.getElementById('ns-select');
+        const $durationSelect = document.getElementById('duration-select');
         const $btnConnect = document.getElementById('btn-connect');
         const $statusDot = document.getElementById('status-dot');
         const $statusText = document.getElementById('status-text');
+        const $durationLabel = document.getElementById('duration-label');
+        const $resolutionLabel = document.getElementById('resolution-label');
+        const $dataPoints = document.getElementById('data-points');
         const $connectHint = document.getElementById('connect-hint');
         const $mainHeader = document.getElementById('main-header');
         const $statsSection = document.getElementById('stats-section');
@@ -567,6 +597,24 @@
 
         function statHtml(formatted) {
             return `${formatted.value}<span class="stat-unit">${formatted.unit}</span>`;
+        }
+
+        // 格式化时间范围显示
+        function formatDuration(minutes) {
+            if (minutes < 60) return `${minutes} 分钟`;
+            if (minutes < 120) return '1 小时';
+            if (minutes < 180) return '2 小时';
+            return '3 小时';
+        }
+
+        // 获取分辨率显示文本
+        function getResolutionText(resolution) {
+            switch (resolution) {
+                case '1s': return '(1秒/点)';
+                case '10s': return '(10秒/点)';
+                case '1m': return '(1分钟/点)';
+                default: return `(${resolution}/点)`;
+            }
         }
 
         /* ═══════════════════════════════════════════
@@ -748,15 +796,12 @@
         /* ═══════════════════════════════════════════
            数据处理
         ═══════════════════════════════════════════ */
-        function processHistoryData(incoming, incremental) {
-            if (incremental && historyData.length > 0) {
-                historyData = historyData.concat(incoming);
-                if (historyData.length > MAX_DATA_POINTS) {
-                    historyData = historyData.slice(-MAX_DATA_POINTS);
-                }
-            } else {
-                historyData = incoming.slice(-MAX_DATA_POINTS);
-            }
+        function processHistoryData(incoming, isAggregated) {
+            historyData = incoming;
+            currentResolution = incoming.length > 0 && incoming[0].resolution ? incoming[0].resolution : '1s';
+
+            // 更新分辨率显示
+            $resolutionLabel.textContent = getResolutionText(currentResolution);
 
             // 重建每个接口的时间序列
             Object.keys(interfaceData).forEach(k => {
@@ -770,44 +815,78 @@
             let totalTxSpeed = 0;
             let prevData = null;
 
-            historyData.forEach((data, index) => {
-                const isLast = index === historyData.length - 1;
-                const time = new Date(data.timestamp).toLocaleTimeString();
-                const intervalMs = prevData ? (data.timestamp_ms - prevData.timestamp_ms) : 1000;
+            // 判断是否为聚合数据
+            if (isAggregated || (historyData.length > 0 && historyData[0].rx_speed_avg !== undefined)) {
+                // 聚合数据处理
+                historyData.forEach((data, index) => {
+                    const isLast = index === historyData.length - 1;
+                    const time = new Date(data.timestamp).toLocaleTimeString();
 
-                (data.interfaces || []).forEach(iface => {
-                    const name = iface.name;
-                    createInterfaceChart(name);
+                    // 聚合数据直接包含平均速度
+                    const rxSpeed = data.rx_speed_avg || 0;
+                    const txSpeed = data.tx_speed_avg || 0;
 
-                    let rxSpeed = 0, txSpeed = 0;
-                    if (prevData) {
-                        const prevIface = (prevData.interfaces || []).find(i => i.name === name);
-                        if (prevIface) {
-                            rxSpeed = calcSpeed(iface.rx_bytes, prevIface.rx_bytes, intervalMs);
-                            txSpeed = calcSpeed(iface.tx_bytes, prevIface.tx_bytes, intervalMs);
-                        }
+                    // 使用默认接口名 'total'
+                    if (!interfaceData['total']) {
+                        createInterfaceChart('total');
                     }
-
-                    interfaceData[name].labels.push(time);
-                    interfaceData[name].rx.push((rxSpeed / 1024).toFixed(2));
-                    interfaceData[name].tx.push((txSpeed / 1024).toFixed(2));
+                    interfaceData['total'].labels.push(time);
+                    interfaceData['total'].rx.push((rxSpeed / 1024).toFixed(2));
+                    interfaceData['total'].tx.push((txSpeed / 1024).toFixed(2));
 
                     if (isLast) {
-                        totalRxSpeed += rxSpeed;
-                        totalTxSpeed += txSpeed;
+                        totalRxSpeed = rxSpeed;
+                        totalTxSpeed = txSpeed;
+                    }
+
+                    // 丢包数据
+                    if (data.rx_dropped_sum !== undefined) {
+                        lossData.labels.push(time);
+                        lossData.rxLoss.push(data.rx_dropped_sum || 0);
+                        lossData.txLoss.push(data.tx_dropped_sum || 0);
                     }
                 });
+            } else {
+                // 原始数据处理
+                historyData.forEach((data, index) => {
+                    const isLast = index === historyData.length - 1;
+                    const time = new Date(data.timestamp).toLocaleTimeString();
+                    const intervalMs = prevData ? (data.timestamp_ms - prevData.timestamp_ms) : 1000;
 
-                if (data.ppp0 && data.ppp0.available && prevData && prevData.ppp0 && prevData.ppp0.available) {
-                    const rxLoss = Math.max(0, data.ppp0.rx_dropped - prevData.ppp0.rx_dropped);
-                    const txLoss = Math.max(0, data.ppp0.tx_dropped - prevData.ppp0.tx_dropped);
-                    lossData.labels.push(time);
-                    lossData.rxLoss.push(rxLoss);
-                    lossData.txLoss.push(txLoss);
-                }
+                    (data.interfaces || []).forEach(iface => {
+                        const name = iface.name;
+                        createInterfaceChart(name);
 
-                prevData = data;
-            });
+                        let rxSpeed = 0, txSpeed = 0;
+                        if (prevData) {
+                            const prevIface = (prevData.interfaces || []).find(i => i.name === name);
+                            if (prevIface) {
+                                rxSpeed = calcSpeed(iface.rx_bytes, prevIface.rx_bytes, intervalMs);
+                                txSpeed = calcSpeed(iface.tx_bytes, prevIface.tx_bytes, intervalMs);
+                            }
+                        }
+
+                        interfaceData[name].labels.push(time);
+                        interfaceData[name].rx.push((rxSpeed / 1024).toFixed(2));
+                        interfaceData[name].tx.push((txSpeed / 1024).toFixed(2));
+
+                        if (isLast) {
+                            totalRxSpeed += rxSpeed;
+                            totalTxSpeed += txSpeed;
+                        }
+                    });
+
+                    if (data.ppp0 && data.ppp0.available && prevData && prevData.ppp0 && prevData.ppp0.available) {
+                        const rxLoss = Math.max(0, data.ppp0.rx_dropped - prevData.ppp0.rx_dropped);
+                        const txLoss = Math.max(0, data.ppp0.tx_dropped - prevData.ppp0.tx_dropped);
+                        lossData.labels.push(time);
+                        lossData.rxLoss.push(rxLoss);
+                        lossData.txLoss.push(txLoss);
+                    }
+
+                    prevData = data;
+                });
+            }
 
             // 更新网卡图表
             Object.keys(interfaceCharts).forEach(name => {
@@ -842,7 +921,7 @@
                 document.getElementById('upload-speed').innerHTML = statHtml(ulSpeed);
                 document.getElementById('total-speed').innerHTML = statHtml(totSpeed);
                 document.getElementById('last-update').textContent = latest.timestamp;
-                document.getElementById('data-points').textContent = `近5分钟（${historyData.length} 个数据点）`;
+                $dataPoints.textContent = `${historyData.length} 个数据点`;
 
                 if (latest.ppp0 && latest.ppp0.available) {
                     const ppp0El = document.getElementById('ppp0-status');
@@ -888,6 +967,30 @@
             }
         }
 
+        // 加载历史数据（根据时间范围）
+        async function loadHistoryData(ns, duration) {
+            const url = `${baseUrl}/api/history?namespace=${encodeURIComponent(ns)}&duration=${duration}`;
+            console.log('[API] 加载历史数据:', url);
+
+            try {
+                const res = await fetch(url);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const result = await res.json();
+
+                console.log('[API] 收到数据:', result.count, '条, 分辨率:', result.data.length > 0 ? result.data[0].resolution : 'N/A');
+
+                clearCharts();
+                processHistoryData(result.data || [], true);
+                showDataUI();
+
+                return result;
+            } catch (e) {
+                console.error('[API] 加载失败:', e);
+                throw e;
+            }
+        }
+
+        // SSE 连接（仅用于实时数据，5分钟范围时使用）
         function connectSSE(ns) {
             disconnectSSE();
 
@@ -905,15 +1008,18 @@
                 eventSource.onmessage = (event) => {
                     try {
                         const msg = JSON.parse(event.data);
-                        if (msg.type === 'history') {
-                            console.log('[SSE] history', msg.data.length);
-                            processHistoryData(msg.data, false);
-                        } else if (msg.type === 'incremental') {
-                            console.log('[SSE] incremental', msg.data.length);
-                            processHistoryData(msg.data, true);
-                        } else if (msg.type === 'current') {
-                            // 单条当前数据，当作增量处理
-                            processHistoryData([msg.data], true);
+                        if (msg.type === 'incremental' && currentDuration <= 5) {
+                            // 只有在5分钟范围内才实时更新
+                            const newData = msg.data || [];
+                            if (newData.length > 0) {
+                                // 增量更新
+                                historyData = historyData.concat(newData);
+                                // 保持最近300条
+                                if (historyData.length > 300) {
+                                    historyData = historyData.slice(-300);
+                                }
+                                processHistoryData(historyData, false);
+                            }
                         }
                     } catch (e) {
                         console.error('[SSE] 消息解析失败:', e);
@@ -931,14 +1037,40 @@
         }
 
         /* ═══════════════════════════════════════════
-           命名空间切换
+           命名空间/时间范围切换
         ═══════════════════════════════════════════ */
-        function switchNamespace(ns) {
+        async function switchNamespace(ns) {
             if (!ns) return;
             currentNs = ns;
             document.getElementById('current-ns-label').textContent = ns;
-            clearCharts();
-            connectSSE(ns);
+
+            // 加载历史数据
+            await loadHistoryData(ns, currentDuration);
+
+            // 如果是5分钟范围，建立SSE实时连接
+            if (currentDuration <= 5) {
+                connectSSE(ns);
+            } else {
+                disconnectSSE();
+                setStatus('connected', `已连接 · ${ns} · ${formatDuration(currentDuration)}`);
+            }
+        }
+
+        async function switchDuration(duration) {
+            currentDuration = duration;
+            $durationLabel.textContent = formatDuration(duration);
+
+            if (currentNs) {
+                await loadHistoryData(currentNs, duration);
+
+                // 如果是5分钟范围，建立SSE实时连接
+                if (duration <= 5) {
+                    connectSSE(currentNs);
+                } else {
+                    disconnectSSE();
+                    setStatus('connected', `已连接 · ${currentNs} · ${formatDuration(duration)}`);
+                }
+            }
         }
 
         /* ═══════════════════════════════════════════
@@ -983,6 +1115,7 @@
                     $nsSelect.appendChild(opt);
                 });
                 $nsSelect.disabled = false;
+                $durationSelect.disabled = false;
 
                 $connectHint.textContent = `✓ 获取到 ${namespaces.length} 个命名空间`;
                 $connectHint.style.color = '#10b981';
@@ -1019,6 +1152,11 @@
         $nsSelect.addEventListener('change', () => {
             const ns = $nsSelect.value;
             if (ns) switchNamespace(ns);
+        });
+
+        $durationSelect.addEventListener('change', () => {
+            const duration = parseInt($durationSelect.value, 10);
+            if (duration) switchDuration(duration);
         });
 
         window.addEventListener('beforeunload', disconnectSSE);

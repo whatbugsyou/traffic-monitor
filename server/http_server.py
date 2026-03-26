@@ -4,6 +4,7 @@
 简易HTTP服务器
 用于提供流量监控Web界面和数据API
 兼容 Python 3.6
+支持分层存储：按时间范围自动选择合适的数据粒度
 """
 
 import http.server
@@ -11,6 +12,7 @@ import json
 import os
 import socketserver
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,6 +22,10 @@ PORT = 8080
 DATA_DIR = "/root/traffic-monitor/data"
 DB_PATH = "/root/traffic-monitor/data/traffic_monitor.db"
 WEB_ROOT = "/root/traffic-monitor/web"
+
+# 聚合间隔配置
+INTERVAL_10S = 10  # 10秒
+INTERVAL_1M = 60  # 1分钟
 
 
 def get_data_file(namespace):
@@ -41,6 +47,343 @@ def parse_query_params(query_string):
         elif param:
             params[param] = ""
     return params
+
+
+def get_history_by_duration(namespace, duration_minutes):
+    """
+    根据时间范围获取历史数据，自动选择合适的数据表
+
+    Args:
+        namespace: 命名空间
+        duration_minutes: 时间范围（分钟）
+
+    Returns:
+        list: 数据列表
+    """
+    if not os.path.exists(DB_PATH):
+        return []
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    now_ms = int(time.time() * 1000)
+    since_ms = now_ms - (duration_minutes * 60 * 1000)
+
+    try:
+        if duration_minutes <= 5:
+            # 5分钟内：使用原始数据（1秒/点）
+            cursor.execute(
+                "SELECT data FROM traffic_history"
+                " WHERE namespace = ? AND timestamp_ms > ?"
+                " ORDER BY timestamp_ms ASC",
+                (namespace, since_ms),
+            )
+            rows = cursor.fetchall()
+            result = []
+            for row in rows:
+                try:
+                    data = json.loads(row[0])
+                    data["resolution"] = "1s"
+                    result.append(data)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+            conn.close()
+            return result
+
+        elif duration_minutes <= 60:
+            # 1小时内：使用10秒聚合数据
+            cursor.execute(
+                "SELECT namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,"
+                "       rx_dropped_sum, tx_dropped_sum, sample_count"
+                " FROM traffic_history_10s"
+                " WHERE namespace = ? AND timestamp_ms > ?"
+                " ORDER BY timestamp_ms ASC",
+                (namespace, since_ms),
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            result = []
+            for ns, ts, ts_ms, rx_speed, tx_speed, rx_drop, tx_drop, sample_cnt in rows:
+                result.append(
+                    {
+                        "namespace": ns,
+                        "timestamp": ts,
+                        "timestamp_ms": ts_ms,
+                        "interfaces": [],  # 聚合数据不包含接口详情
+                        "rx_speed_avg": rx_speed,
+                        "tx_speed_avg": tx_speed,
+                        "rx_dropped_sum": rx_drop,
+                        "tx_dropped_sum": tx_drop,
+                        "resolution": "10s",
+                    }
+                )
+            return result
+
+        else:
+            # 超过1小时：使用1分钟聚合数据
+            cursor.execute(
+                "SELECT namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,"
+                "       rx_dropped_sum, tx_dropped_sum, sample_count"
+                " FROM traffic_history_1m"
+                " WHERE namespace = ? AND timestamp_ms > ?"
+                " ORDER BY timestamp_ms ASC",
+                (namespace, since_ms),
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            result = []
+            for ns, ts, ts_ms, rx_speed, tx_speed, rx_drop, tx_drop, sample_cnt in rows:
+                result.append(
+                    {
+                        "namespace": ns,
+                        "timestamp": ts,
+                        "timestamp_ms": ts_ms,
+                        "interfaces": [],
+                        "rx_speed_avg": rx_speed,
+                        "tx_speed_avg": tx_speed,
+                        "rx_dropped_sum": rx_drop,
+                        "tx_dropped_sum": tx_drop,
+                        "resolution": "1m",
+                    }
+                )
+            return result
+
+    except sqlite3.OperationalError:
+        conn.close()
+        return []
+
+
+def aggregate_data_for_namespace(namespace):
+    """
+    为指定命名空间聚合数据
+    从原始数据生成10秒和1分钟聚合数据
+    """
+    if not os.path.exists(DB_PATH):
+        return
+
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    cursor = conn.cursor()
+
+    now_ms = int(time.time() * 1000)
+
+    # ═══════════════════════════════════════════
+    # 生成10秒聚合数据
+    # ═══════════════════════════════════════════
+    one_hour_ago_ms = now_ms - (60 * 60 * 1000)
+
+    cursor.execute(
+        "SELECT data, timestamp_ms FROM traffic_history"
+        " WHERE namespace = ? AND timestamp_ms > ?"
+        " ORDER BY timestamp_ms ASC",
+        (namespace, one_hour_ago_ms),
+    )
+    rows = cursor.fetchall()
+
+    if rows:
+        # 按10秒分组
+        groups_10s = {}
+        prev_data = None
+
+        for data_json, ts_ms in rows:
+            try:
+                data = json.loads(data_json)
+                group_key = (ts_ms // (INTERVAL_10S * 1000)) * (INTERVAL_10S * 1000)
+
+                if group_key not in groups_10s:
+                    groups_10s[group_key] = {
+                        "rx_speeds": [],
+                        "tx_speeds": [],
+                        "rx_dropped_list": [],
+                        "tx_dropped_list": [],
+                        "timestamp": None,
+                        "prev_data": None,
+                    }
+
+                groups_10s[group_key]["timestamp"] = data.get("timestamp")
+
+                # 计算速度（需要上一条数据）
+                if prev_data is not None:
+                    interval_ms = ts_ms - prev_data.get("timestamp_ms", ts_ms)
+                    if interval_ms > 0:
+                        for iface in data.get("interfaces", []):
+                            iface_name = iface.get("name")
+                            prev_iface = None
+                            for pi in prev_data.get("interfaces", []):
+                                if pi.get("name") == iface_name:
+                                    prev_iface = pi
+                                    break
+
+                            if prev_iface:
+                                rx_speed = (
+                                    (
+                                        iface.get("rx_bytes", 0)
+                                        - prev_iface.get("rx_bytes", 0)
+                                    )
+                                    * 1000
+                                    / interval_ms
+                                )
+                                tx_speed = (
+                                    (
+                                        iface.get("tx_bytes", 0)
+                                        - prev_iface.get("tx_bytes", 0)
+                                    )
+                                    * 1000
+                                    / interval_ms
+                                )
+                                groups_10s[group_key]["rx_speeds"].append(rx_speed)
+                                groups_10s[group_key]["tx_speeds"].append(tx_speed)
+
+                if data.get("ppp0", {}).get("available"):
+                    groups_10s[group_key]["rx_dropped_list"].append(
+                        data["ppp0"].get("rx_dropped", 0)
+                    )
+                    groups_10s[group_key]["tx_dropped_list"].append(
+                        data["ppp0"].get("tx_dropped", 0)
+                    )
+
+                prev_data = data
+
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+        # 写入10秒聚合表
+        for group_key, group_data in groups_10s.items():
+            if group_data["rx_speeds"]:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO traffic_history_10s"
+                    " (namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,"
+                    "  rx_dropped_sum, tx_dropped_sum, sample_count)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        namespace,
+                        group_data["timestamp"],
+                        group_key,
+                        sum(group_data["rx_speeds"]) / len(group_data["rx_speeds"])
+                        if group_data["rx_speeds"]
+                        else 0,
+                        sum(group_data["tx_speeds"]) / len(group_data["tx_speeds"])
+                        if group_data["tx_speeds"]
+                        else 0,
+                        max(group_data["rx_dropped_list"])
+                        if group_data["rx_dropped_list"]
+                        else 0,
+                        max(group_data["tx_dropped_list"])
+                        if group_data["tx_dropped_list"]
+                        else 0,
+                        len(group_data["rx_speeds"]),
+                    ),
+                )
+
+    # ═══════════════════════════════════════════
+    # 生成1分钟聚合数据（从10秒聚合表）
+    # ═══════════════════════════════════════════
+    three_hours_ago_ms = now_ms - (3 * 60 * 60 * 1000)
+
+    cursor.execute(
+        "SELECT rx_speed_avg, tx_speed_avg, rx_dropped_sum, tx_dropped_sum,"
+        "       sample_count, timestamp, timestamp_ms"
+        " FROM traffic_history_10s"
+        " WHERE namespace = ? AND timestamp_ms > ?"
+        " ORDER BY timestamp_ms ASC",
+        (namespace, three_hours_ago_ms),
+    )
+    rows_10s = cursor.fetchall()
+
+    if rows_10s:
+        groups_1m = {}
+
+        for rx_avg, tx_avg, rx_drop, tx_drop, sample_cnt, ts, ts_ms in rows_10s:
+            group_key = (ts_ms // (INTERVAL_1M * 1000)) * (INTERVAL_1M * 1000)
+
+            if group_key not in groups_1m:
+                groups_1m[group_key] = {
+                    "rx_speeds": [],
+                    "tx_speeds": [],
+                    "rx_dropped": [],
+                    "tx_dropped": [],
+                    "timestamps": [],
+                }
+
+            groups_1m[group_key]["rx_speeds"].append(rx_avg)
+            groups_1m[group_key]["tx_speeds"].append(tx_avg)
+            groups_1m[group_key]["rx_dropped"].append(rx_drop)
+            groups_1m[group_key]["tx_dropped"].append(tx_drop)
+            groups_1m[group_key]["timestamps"].append(ts)
+
+        for group_key, group_data in groups_1m.items():
+            if group_data["rx_speeds"]:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO traffic_history_1m"
+                    " (namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,"
+                    "  rx_dropped_sum, tx_dropped_sum, sample_count)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        namespace,
+                        group_data["timestamps"][-1]
+                        if group_data["timestamps"]
+                        else None,
+                        group_key,
+                        sum(group_data["rx_speeds"]) / len(group_data["rx_speeds"]),
+                        sum(group_data["tx_speeds"]) / len(group_data["tx_speeds"]),
+                        max(group_data["rx_dropped"])
+                        if group_data["rx_dropped"]
+                        else 0,
+                        max(group_data["tx_dropped"])
+                        if group_data["tx_dropped"]
+                        else 0,
+                        len(group_data["rx_speeds"]),
+                    ),
+                )
+
+    conn.commit()
+    conn.close()
+
+
+def aggregate_all_namespaces():
+    """聚合所有命名空间的数据"""
+    if not os.path.exists(DB_PATH):
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT DISTINCT namespace FROM traffic_history")
+        namespaces = [row[0] for row in cursor.fetchall()]
+    except sqlite3.OperationalError:
+        conn.close()
+        return
+
+    conn.close()
+
+    for ns in namespaces:
+        try:
+            aggregate_data_for_namespace(ns)
+        except Exception as e:
+            print("[聚合] 命名空间 %s 聚合失败: %s" % (ns, str(e)))
+
+
+class AggregationThread(threading.Thread):
+    """后台聚合线程"""
+
+    def __init__(self, interval=10):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.running = True
+
+    def run(self):
+        print("[聚合线程] 启动，间隔 %d 秒" % self.interval)
+        while self.running:
+            try:
+                aggregate_all_namespaces()
+            except Exception as e:
+                print("[聚合线程] 错误: %s" % str(e))
+            time.sleep(self.interval)
+
+    def stop(self):
+        self.running = False
 
 
 class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
@@ -73,10 +416,16 @@ class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
 
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT DISTINCT namespace FROM traffic_history ORDER BY namespace ASC"
-            )
-            rows = cursor.fetchall()
+
+            # 从原始数据表获取命名空间
+            try:
+                cursor.execute(
+                    "SELECT DISTINCT namespace FROM traffic_history ORDER BY namespace ASC"
+                )
+                rows = cursor.fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
             conn.close()
 
             namespaces = [row[0] for row in rows]
@@ -102,11 +451,38 @@ class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
             self.send_json_response({"error": str(e)}, 500)
 
     def handle_history_data(self):
-        """返回历史流量数据，支持 ?namespace= 和 ?since= 参数"""
+        """
+        返回历史流量数据
+
+        支持参数:
+        - namespace: 命名空间（默认 default）
+        - duration: 时间范围（分钟），5/10/15/30/60/120/180
+        - since: 时间戳（毫秒），向后兼容
+        """
         try:
             parsed_path = urlparse(self.path)
             params = parse_query_params(parsed_path.query)
             namespace = params.get("namespace", "default")
+
+            # 优先使用 duration 参数
+            if "duration" in params:
+                duration_str = params.get("duration", "5")
+                duration_minutes = int(duration_str) if duration_str.isdigit() else 5
+                # 限制范围
+                duration_minutes = max(5, min(180, duration_minutes))
+
+                data = get_history_by_duration(namespace, duration_minutes)
+                self.send_json_response(
+                    {
+                        "namespace": namespace,
+                        "duration_minutes": duration_minutes,
+                        "count": len(data),
+                        "data": data,
+                    }
+                )
+                return
+
+            # 向后兼容：使用 since 参数
             since = params.get("since")
             since_ms = int(since) if since and since.isdigit() else None
 
@@ -125,11 +501,13 @@ class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
                     (namespace, since_ms),
                 )
             else:
+                # 默认返回最近5分钟
+                since_ms = int(time.time() * 1000) - (5 * 60 * 1000)
                 cursor.execute(
                     "SELECT data FROM traffic_history"
-                    " WHERE namespace = ?"
+                    " WHERE namespace = ? AND timestamp_ms > ?"
                     " ORDER BY timestamp_ms ASC",
-                    (namespace,),
+                    (namespace, since_ms),
                 )
 
             rows = cursor.fetchall()
@@ -155,7 +533,7 @@ class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
             last_timestamp = 0
-            print("[SSE] 客户端连接建立，namespace=%s，开始推送数据..." % namespace)
+            print("[SSE] 客户端连接建立，namespace=%s" % namespace)
 
             while True:
                 try:
@@ -269,35 +647,48 @@ class TrafficMonitorHandler(http.server.SimpleHTTPRequestHandler):
         )
 
 
+# 全局聚合线程
+aggregation_thread = None
+
+
 def run_server():
     """启动HTTP服务器"""
+    global aggregation_thread
+
     Path(WEB_ROOT).mkdir(parents=True, exist_ok=True)
+
+    # 启动后台聚合线程
+    aggregation_thread = AggregationThread(interval=10)
+    aggregation_thread.start()
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     with socketserver.ThreadingTCPServer(("", PORT), TrafficMonitorHandler) as httpd:
         print("HTTP服务器启动在端口 %d" % PORT)
         print("Web根目录: %s" % WEB_ROOT)
         print("访问地址: http://localhost:%d" % PORT)
+        print("")
         print("API端点:")
-        print("  - http://localhost:%d/api/namespaces        (命名空间列表)" % PORT)
+        print("  GET /api/namespaces                  - 命名空间列表")
+        print("  GET /api/current?namespace=<ns>      - 当前数据")
         print(
-            "  - http://localhost:%d/api/current           (当前流量数据，支持 ?namespace=)"
-            % PORT
+            "  GET /api/history?namespace=<ns>&duration=<分钟> - 历史数据（按时间范围）"
         )
-        print(
-            "  - http://localhost:%d/api/history           (历史流量数据，支持 ?namespace= ?since=)"
-            % PORT
-        )
-        print(
-            "  - http://localhost:%d/api/stream            (SSE实时数据流，支持 ?namespace=)"
-            % PORT
-        )
-        print("\n按 Ctrl+C 停止服务器")
+        print("  GET /api/stream?namespace=<ns>       - SSE实时流")
+        print("")
+        print("时间范围选项 (duration 参数):")
+        print("  5 分钟   → 原始数据 (1秒/点, ~300条)")
+        print("  10-60分钟 → 10秒聚合 (~360条)")
+        print("  1-3小时   → 1分钟聚合 (~180条)")
+        print("")
+        print("按 Ctrl+C 停止服务器")
 
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\n服务器已停止")
+            print("\n正在停止服务器...")
+            if aggregation_thread:
+                aggregation_thread.stop()
+            print("服务器已停止")
 
 
 if __name__ == "__main__":
