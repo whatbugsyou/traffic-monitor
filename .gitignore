@@ -77,3 +77,4 @@ doc/
 
 # Project-specific
 bin/
+.zed/
