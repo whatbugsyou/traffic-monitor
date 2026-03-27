@@ -1,13 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
-
-
 
 use crate::database::Database;
 use crate::models::*;
@@ -22,23 +21,24 @@ pub struct TrafficCollector {
     db: Arc<Database>,
     config: CollectorConfig,
     namespaces: Arc<RwLock<Vec<String>>>,
-    data_sender: broadcast::Sender<TrafficData>,
+    /// 每个命名空间独立的广播通道，实现精准订阅
+    data_senders: Arc<RwLock<HashMap<String, broadcast::Sender<TrafficData>>>>,
     shutdown: broadcast::Sender<()>,
 }
 
 impl TrafficCollector {
     /// 创建新的采集器
     pub fn new(db: Arc<Database>, config: CollectorConfig) -> Result<Self> {
-        let (data_sender, _) = broadcast::channel(1000);
         let (shutdown, _) = broadcast::channel(1);
 
         let namespaces = Arc::new(RwLock::new(Vec::new()));
+        let data_senders = Arc::new(RwLock::new(HashMap::new()));
 
         Ok(TrafficCollector {
             db,
             config,
             namespaces,
-            data_sender,
+            data_senders,
             shutdown,
         })
     }
@@ -47,6 +47,19 @@ impl TrafficCollector {
     pub async fn start(&self) -> Result<()> {
         // 发现所有命名空间
         self.discover_namespaces().await?;
+
+        // 为每个命名空间创建广播通道
+        {
+            let namespaces = self.namespaces.read().await;
+            let mut senders = self.data_senders.write().await;
+            for namespace in namespaces.iter() {
+                if !senders.contains_key(namespace) {
+                    let (sender, _) = broadcast::channel(100);
+                    senders.insert(namespace.clone(), sender);
+                    log::info!("Created broadcast channel for namespace: {}", namespace);
+                }
+            }
+        }
 
         // 启动命名空间监控任务
         let namespaces = self.namespaces.read().await.clone();
@@ -92,6 +105,7 @@ impl TrafficCollector {
     /// 启动命名空间发现任务
     async fn start_namespace_discovery(&self) -> Result<()> {
         let namespaces = Arc::clone(&self.namespaces);
+        let data_senders = Arc::clone(&self.data_senders);
         let mut shutdown_rx = self.shutdown.subscribe();
 
         tokio::spawn(async move {
@@ -121,6 +135,17 @@ impl TrafficCollector {
                         let mut ns_guard = namespaces.write().await;
                         if *ns_guard != new_namespaces {
                             log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, new_namespaces);
+
+                            // 为新命名空间创建广播通道
+                            let mut senders = data_senders.write().await;
+                            for namespace in &new_namespaces {
+                                if !senders.contains_key(namespace) {
+                                    let (sender, _) = broadcast::channel(100);
+                                    senders.insert(namespace.clone(), sender);
+                                    log::info!("Created broadcast channel for new namespace: {}", namespace);
+                                }
+                            }
+
                             *ns_guard = new_namespaces;
                         }
                     }
@@ -138,9 +163,10 @@ impl TrafficCollector {
     /// 启动单个命名空间的采集任务
     async fn start_namespace_collector(&self, namespace: String) -> Result<()> {
         let db = Arc::clone(&self.db);
-        let data_sender = self.data_sender.clone();
+        let data_senders = Arc::clone(&self.data_senders);
         let mut shutdown_rx = self.shutdown.subscribe();
         let config = self.config.clone();
+        let namespace_clone = namespace.clone();
 
         tokio::spawn(async move {
             let mut collect_interval = interval(Duration::from_secs(config.interval_secs));
@@ -149,75 +175,78 @@ impl TrafficCollector {
             let mut last_1h_ts: Option<i64> = None;
             let mut last_1d_ts: Option<i64> = None;
 
-            log::info!("Started collector for namespace: {}", namespace);
+            log::info!("Started collector for namespace: {}", namespace_clone);
 
             loop {
                 tokio::select! {
                     _ = collect_interval.tick() => {
-                        match collect_namespace_data(&namespace).await {
+                        match collect_namespace_data(&namespace_clone).await {
                             Ok(data) => {
                                 let timestamp_ms = data.timestamp_ms;
 
                                 // 存储原始数据
                                 if let Err(e) = db.insert_traffic_data(&data) {
-                                    log::error!("Failed to store data for {}: {}", namespace, e);
+                                    log::error!("Failed to store data for {}: {}", namespace_clone, e);
                                 }
 
                                 // 检查是否到达10秒聚合点
                                 if should_aggregate(timestamp_ms, last_10s_ts, INTERVAL_10S) {
                                     if let Err(e) = db.insert_10s_aggregated(&data) {
-                                        log::error!("Failed to store 10s aggregated data for {}: {}", namespace, e);
+                                        log::error!("Failed to store 10s aggregated data for {}: {}", namespace_clone, e);
                                     }
                                     last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
-                                    log::debug!("Saved 10s aggregated data for {} at {}", namespace, data.timestamp);
+                                    log::debug!("Saved 10s aggregated data for {} at {}", namespace_clone, data.timestamp);
                                 }
 
                                 // 检查是否到达1分钟聚合点
                                 if should_aggregate(timestamp_ms, last_1m_ts, INTERVAL_1M) {
                                     if let Err(e) = db.insert_1m_aggregated(&data) {
-                                        log::error!("Failed to store 1m aggregated data for {}: {}", namespace, e);
+                                        log::error!("Failed to store 1m aggregated data for {}: {}", namespace_clone, e);
                                     }
                                     last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
-                                    log::debug!("Saved 1m aggregated data for {} at {}", namespace, data.timestamp);
+                                    log::debug!("Saved 1m aggregated data for {} at {}", namespace_clone, data.timestamp);
                                 }
 
                                 // 检查是否到达1小时聚合点
                                 if should_aggregate(timestamp_ms, last_1h_ts, INTERVAL_1H) {
                                     if let Err(e) = db.insert_1h_aggregated(&data) {
-                                        log::error!("Failed to store 1h aggregated data for {}: {}", namespace, e);
+                                        log::error!("Failed to store 1h aggregated data for {}: {}", namespace_clone, e);
                                     }
                                     last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
-                                    log::debug!("Saved 1h aggregated data for {} at {}", namespace, data.timestamp);
+                                    log::debug!("Saved 1h aggregated data for {} at {}", namespace_clone, data.timestamp);
                                 }
 
                                 // 检查是否到达1天聚合点
                                 if should_aggregate(timestamp_ms, last_1d_ts, INTERVAL_1D) {
                                     if let Err(e) = db.insert_1d_aggregated(&data) {
-                                        log::error!("Failed to store 1d aggregated data for {}: {}", namespace, e);
+                                        log::error!("Failed to store 1d aggregated data for {}: {}", namespace_clone, e);
                                     }
                                     last_1d_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1D));
-                                    log::debug!("Saved 1d aggregated data for {} at {}", namespace, data.timestamp);
+                                    log::debug!("Saved 1d aggregated data for {} at {}", namespace_clone, data.timestamp);
                                 }
 
-                                // 广播数据（如果没有订阅者则跳过，数据已存储到数据库）
-                                match data_sender.send(data.clone()) {
-                                    Ok(subscriber_count) => {
-                                        if subscriber_count > 0 {
-                                            log::info!("Broadcasting data for namespace {} to {} subscribers", namespace, subscriber_count);
+                                // 向该命名空间的订阅者广播数据
+                                let senders = data_senders.read().await;
+                                if let Some(sender) = senders.get(&namespace_clone) {
+                                    match sender.send(data.clone()) {
+                                        Ok(subscriber_count) => {
+                                            if subscriber_count > 0 {
+                                                log::debug!("Broadcasting data for namespace {} to {} subscribers", namespace_clone, subscriber_count);
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        log::info!("Failed to broadcast data for namespace {}: {}", namespace, e);
+                                        Err(e) => {
+                                            log::debug!("Failed to broadcast data for namespace {}: {}", namespace_clone, e);
+                                        }
                                     }
                                 }
                             }
                             Err(e) => {
-                                log::error!("Failed to collect data for {}: {}", namespace, e);
+                                log::error!("Failed to collect data for {}: {}", namespace_clone, e);
                             }
                         }
                     }
                     _ = shutdown_rx.recv() => {
-                        log::info!("Collector stopped for namespace: {}", namespace);
+                        log::info!("Collector stopped for namespace: {}", namespace_clone);
                         break;
                     }
                 }
@@ -227,10 +256,16 @@ impl TrafficCollector {
         Ok(())
     }
 
-    /// 获取数据接收器
-    pub fn subscribe(&self) -> broadcast::Receiver<TrafficData> {
-        log::info!("New subscriber connected to data stream");
-        self.data_sender.subscribe()
+    /// 订阅特定命名空间的数据（精准订阅）
+    pub async fn subscribe(&self, namespace: &str) -> Option<broadcast::Receiver<TrafficData>> {
+        let senders = self.data_senders.read().await;
+        if let Some(sender) = senders.get(namespace) {
+            log::info!("New subscriber connected for namespace: {}", namespace);
+            Some(sender.subscribe())
+        } else {
+            log::warn!("Namespace not found for subscription: {}", namespace);
+            None
+        }
     }
 
     /// 获取所有已发现的命名空间

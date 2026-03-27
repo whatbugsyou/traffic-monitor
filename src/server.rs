@@ -137,37 +137,40 @@ async fn sse_stream(
     let namespace = query.namespace.as_deref().unwrap_or("default").to_string();
     log::info!("SSE stream connected for namespace: {}", namespace);
 
-    // 订阅数据流
-    let mut receiver = collector.subscribe();
+    // 精准订阅指定命名空间的数据流
+    let receiver = collector.subscribe(&namespace).await;
 
-    // 创建 SSE 流
+    // 如果命名空间不存在，返回错误
+    let mut receiver = match receiver {
+        Some(rx) => rx,
+        None => {
+            log::warn!("Namespace not found for SSE stream: {}", namespace);
+            return HttpResponse::NotFound().body(format!("Namespace not found: {}", namespace));
+        }
+    };
+
+    // 创建 SSE 流（精准订阅，无需过滤）
     let stream = async_stream::stream! {
         log::info!("SSE stream started for namespace: {}", namespace);
         loop {
             match receiver.recv().await {
                 Ok(data) => {
-                    log::info!("Received data for namespace: {}, requested: {}", data.namespace, namespace);
-                    // 过滤指定命名空间的数据
-                    if data.namespace == namespace {
-                        log::info!("Namespace matched, sending SSE data");
-                        let message = SseMessage {
-                            message_type: "incremental".to_string(),
-                            data: vec![data],
-                        };
+                    // 精准订阅，直接发送数据
+                    let message = SseMessage {
+                        message_type: "incremental".to_string(),
+                        data: vec![data],
+                    };
 
-                        if let Ok(json) = serde_json::to_string(&message) {
-                            yield Ok(web::Bytes::from(format!("data: {}\n\n", json))) as Result<web::Bytes, std::convert::Infallible>;
-                        }
-                    } else {
-                        log::debug!("Namespace mismatch, skipping data");
+                    if let Ok(json) = serde_json::to_string(&message) {
+                        yield Ok(web::Bytes::from(format!("data: {}\n\n", json))) as Result<web::Bytes, std::convert::Infallible>;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    log::info!("SSE stream closed");
+                    log::info!("SSE stream closed for namespace: {}", namespace);
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    log::warn!("SSE stream lagged, continuing");
+                    log::warn!("SSE stream lagged for namespace: {}, continuing", namespace);
                     // 继续接收，忽略滞后消息
                     continue;
                 }
