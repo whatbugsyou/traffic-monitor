@@ -1,22 +1,79 @@
-# 数据文件
-data/
-*.db
-*.json
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
 
-# 日志文件
-logs/
-*.log
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-*
 
-# PID 文件
-*.pid
-
-# macOS
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
+# Logs and runtime files
+*.log
+*.pid
+logs/
+nohup.out
 
-# 备份
-backups/
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/*.db
+data/*.db-*
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Test coverage
+coverage/
+*.profraw
+*.profdata
+
+# Documentation builds
+doc/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Compiled files
+*.o
+*.so
+*.dylib
+*.dll
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Package files
+*.deb
+*.rpm
+*.tar.gz
+*.zip
+
+# Project-specific
+bin/

@@ -1,0 +1,77 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Source code
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Web files
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+
+# Configuration files
+*.conf text eol=lf
+*.config text eol=lf
+.env* text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+Makefile text eol=lf
+LICENSE text eol=lf
+
+# Service files
+*.service text eol=lf
+
+# Binary files
+*.db binary
+*.db-journal binary
+*.db-wal binary
+*.db-shm binary
+*.sqlite binary
+*.sqlite3 binary
+*.log binary
+*.pid binary
+
+# Archives
+*.zip binary
+*.tar.gz binary
+*.tar.bz2 binary
+*.tar.xz binary
+*.deb binary
+*.rpm binary
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg text eol=lf
+
+# Documents
+*.pdf binary
+*.doc binary
+*.docx binary
+
+# Rust specific
+Cargo.lock text eol=lf
+
+# Exclude from GitHub language stats
+*.lock linguist-generated
+Cargo.lock linguist-generated
+
+# Diff settings
+*.rs diff=rust
+*.toml diff=toml
+*.md diff=markdown
