@@ -79,17 +79,10 @@ async fn index_handler() -> impl Responder {
 }
 
 /// 获取命名空间列表
-async fn get_namespaces(db: web::Data<Arc<Database>>) -> impl Responder {
-    match db.get_namespaces() {
-        Ok(namespaces) => {
-            let response = NamespacesResponse { namespaces };
-            HttpResponse::Ok().json(response)
-        }
-        Err(e) => {
-            log::error!("Failed to get namespaces: {}", e);
-            HttpResponse::InternalServerError().body(format!("Failed to get namespaces: {}", e))
-        }
-    }
+async fn get_namespaces(collector: web::Data<Arc<TrafficCollector>>) -> impl Responder {
+    let namespaces = collector.get_namespaces().await;
+    let response = NamespacesResponse { namespaces };
+    HttpResponse::Ok().json(response)
 }
 
 /// 获取当前数据
@@ -142,17 +135,21 @@ async fn sse_stream(
     query: web::Query<StreamQuery>,
 ) -> impl Responder {
     let namespace = query.namespace.as_deref().unwrap_or("default").to_string();
+    log::info!("SSE stream connected for namespace: {}", namespace);
 
     // 订阅数据流
     let mut receiver = collector.subscribe();
 
     // 创建 SSE 流
     let stream = async_stream::stream! {
+        log::info!("SSE stream started for namespace: {}", namespace);
         loop {
             match receiver.recv().await {
                 Ok(data) => {
+                    log::info!("Received data for namespace: {}, requested: {}", data.namespace, namespace);
                     // 过滤指定命名空间的数据
                     if data.namespace == namespace {
+                        log::info!("Namespace matched, sending SSE data");
                         let message = SseMessage {
                             message_type: "incremental".to_string(),
                             data: vec![data],
@@ -161,12 +158,16 @@ async fn sse_stream(
                         if let Ok(json) = serde_json::to_string(&message) {
                             yield Ok(web::Bytes::from(format!("data: {}\n\n", json))) as Result<web::Bytes, std::convert::Infallible>;
                         }
+                    } else {
+                        log::debug!("Namespace mismatch, skipping data");
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
+                    log::info!("SSE stream closed");
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
+                    log::warn!("SSE stream lagged, continuing");
                     // 继续接收，忽略滞后消息
                     continue;
                 }
