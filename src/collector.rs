@@ -7,6 +7,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
 
+
+
 use crate::database::Database;
 use crate::models::*;
 
@@ -198,7 +200,16 @@ impl TrafficCollector {
                                 }
 
                                 // 广播数据（如果没有订阅者则跳过，数据已存储到数据库）
-                                let _ = data_sender.send(data);
+                                match data_sender.send(data.clone()) {
+                                    Ok(subscriber_count) => {
+                                        if subscriber_count > 0 {
+                                            log::info!("Broadcasting data for namespace {} to {} subscribers", namespace, subscriber_count);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::info!("Failed to broadcast data for namespace {}: {}", namespace, e);
+                                    }
+                                }
                             }
                             Err(e) => {
                                 log::error!("Failed to collect data for {}: {}", namespace, e);
@@ -218,7 +229,13 @@ impl TrafficCollector {
 
     /// 获取数据接收器
     pub fn subscribe(&self) -> broadcast::Receiver<TrafficData> {
+        log::info!("New subscriber connected to data stream");
         self.data_sender.subscribe()
+    }
+
+    /// 获取所有已发现的命名空间
+    pub async fn get_namespaces(&self) -> Vec<String> {
+        self.namespaces.read().await.clone()
     }
 
     /// 停止采集器
@@ -253,15 +270,11 @@ async fn collect_namespace_data(namespace: &str) -> Result<TrafficData> {
     // 采集接口数据
     let interfaces = collect_interfaces(namespace).await?;
 
-    // 采集 ppp0 数据
-    let ppp0 = collect_ppp0_stats(namespace).await?;
-
     let data = TrafficData {
         namespace: namespace.to_string(),
         timestamp,
         timestamp_ms,
         interfaces,
-        ppp0,
         resolution: Some("1s".to_string()),
     };
 
@@ -276,8 +289,8 @@ async fn collect_interfaces(namespace: &str) -> Result<Vec<InterfaceStats>> {
         // 默认命名空间：直接读取 /sys/class/net/
         collect_interfaces_from_sysfs("/sys/class/net", &mut interfaces)?;
     } else {
-        // 其他命名空间：使用 ip netns exec
-        collect_interfaces_via_ip_command(namespace, &mut interfaces).await?;
+        // 其他命名空间：使用 setns 系统调用切换命名空间
+        collect_interfaces_via_setns(namespace, &mut interfaces)?;
     }
 
     Ok(interfaces)
@@ -329,147 +342,54 @@ fn collect_interfaces_from_sysfs(
     Ok(())
 }
 
-/// 通过 ip netns exec 命令读取接口数据
-async fn collect_interfaces_via_ip_command(
+/// 采集非默认命名空间的网络接口数据（使用 setns 系统调用，无需 fork）
+fn collect_interfaces_via_setns(
     namespace: &str,
     interfaces: &mut Vec<InterfaceStats>,
 ) -> Result<()> {
-    use std::process::Command;
+    use std::os::unix::io::AsRawFd;
 
-    let output = Command::new("ip")
-        .args(["netns", "exec", namespace, "ls", "/sys/class/net"])
-        .output()
-        .context("Failed to execute ip netns exec command")?;
-
-    if !output.status.success() {
-        return Ok(());
+    /// 命名空间 guard，drop 时自动恢复原命名空间
+    struct NamespaceGuard {
+        original_ns_fd: i32,
     }
 
-    let dev_list = String::from_utf8_lossy(&output.stdout);
-    let devices: Vec<&str> = dev_list.split_whitespace().collect();
-
-    for dev in devices {
-        // 排除 lo、VLAN 子接口、veth 别名
-        if dev == "lo" || dev.contains('.') || dev.contains('@') {
-            continue;
-        }
-
-        // 读取 rx_bytes
-        let rx_output = Command::new("ip")
-            .args([
-                "netns",
-                "exec",
-                namespace,
-                "cat",
-                &format!("/sys/class/net/{}/statistics/rx_bytes", dev),
-            ])
-            .output()
-            .context("Failed to read rx_bytes")?;
-
-        let rx_bytes = String::from_utf8_lossy(&rx_output.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0);
-
-        // 读取 tx_bytes
-        let tx_output = Command::new("ip")
-            .args([
-                "netns",
-                "exec",
-                namespace,
-                "cat",
-                &format!("/sys/class/net/{}/statistics/tx_bytes", dev),
-            ])
-            .output()
-            .context("Failed to read tx_bytes")?;
-
-        let tx_bytes = String::from_utf8_lossy(&tx_output.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0);
-
-        interfaces.push(InterfaceStats {
-            name: dev.to_string(),
-            rx_bytes,
-            tx_bytes,
-            rx_speed: None,
-            tx_speed: None,
-        });
-    }
-
-    Ok(())
-}
-
-/// 采集 ppp0 接口统计信息
-async fn collect_ppp0_stats(namespace: &str) -> Result<Ppp0Stats> {
-    use std::process::Command;
-
-    // 检查 ppp0 是否存在
-    let ppp0_exists = if namespace == "default" {
-        Path::new("/sys/class/net/ppp0").exists()
-    } else {
-        Command::new("ip")
-            .args([
-                "netns",
-                "exec",
-                namespace,
-                "test",
-                "-d",
-                "/sys/class/net/ppp0",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-
-    if !ppp0_exists {
-        return Ok(Ppp0Stats::unavailable());
-    }
-
-    // 使用 ifconfig 读取详细统计
-    let output = if namespace == "default" {
-        Command::new("ifconfig")
-            .arg("ppp0")
-            .output()
-            .context("Failed to execute ifconfig ppp0")?
-    } else {
-        Command::new("ip")
-            .args(["netns", "exec", namespace, "ifconfig", "ppp0"])
-            .output()
-            .context("Failed to execute ifconfig ppp0 in namespace")?
-    };
-
-    if !output.status.success() {
-        return Ok(Ppp0Stats::unavailable());
-    }
-
-    parse_ifconfig_output(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// 解析 ifconfig 输出
-fn parse_ifconfig_output(output: &str) -> Result<Ppp0Stats> {
-    let mut stats = Ppp0Stats::unavailable();
-    stats.available = true;
-
-    for line in output.lines() {
-        if line.contains("RX packets") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            stats.rx_packets = parts.get(2).and_then(|s| s.parse().ok());
-            stats.rx_errors = parts.get(4).and_then(|s| s.parse().ok());
-            stats.rx_dropped = parts.get(6).and_then(|s| s.parse().ok());
-            stats.rx_overruns = parts.get(8).and_then(|s| s.parse().ok());
-            stats.rx_frame = parts.get(10).and_then(|s| s.parse().ok());
-        } else if line.contains("TX packets") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            stats.tx_packets = parts.get(2).and_then(|s| s.parse().ok());
-            stats.tx_errors = parts.get(4).and_then(|s| s.parse().ok());
-            stats.tx_dropped = parts.get(6).and_then(|s| s.parse().ok());
-            stats.tx_overruns = parts.get(8).and_then(|s| s.parse().ok());
-            stats.tx_carrier = parts.get(10).and_then(|s| s.parse().ok());
+    impl Drop for NamespaceGuard {
+        fn drop(&mut self) {
+            // 恢复原命名空间，忽略错误
+            unsafe {
+                libc::setns(self.original_ns_fd, libc::CLONE_NEWNET);
+            }
         }
     }
 
-    Ok(stats)
+    // 打开当前命名空间的 fd（用于恢复）
+    let original_ns =
+        fs::File::open("/proc/self/ns/net").context("Failed to open current namespace")?;
+    let original_ns_fd = original_ns.as_raw_fd();
+
+    // 打开目标命名空间
+    let target_path = format!("/var/run/netns/{}", namespace);
+    let target_ns = fs::File::open(&target_path)
+        .with_context(|| format!("Failed to open namespace: {}", target_path))?;
+
+    // 切换到目标命名空间
+    unsafe {
+        let ret = libc::setns(target_ns.as_raw_fd(), libc::CLONE_NEWNET);
+        if ret != 0 {
+            return Err(anyhow::anyhow!(
+                "Failed to setns to {}: {}",
+                namespace,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    // 创建 guard，确保函数退出时恢复原命名空间
+    let _guard = NamespaceGuard { original_ns_fd };
+
+    // 现在已经在目标命名空间中，直接读取 /sys/class/net/
+    collect_interfaces_from_sysfs("/sys/class/net", interfaces)
 }
 
 /// 读取 sysfs 值
@@ -512,22 +432,5 @@ mod tests {
         // 进入下一个时间窗口应该聚合
         assert!(should_aggregate(20000, Some(10000), INTERVAL_10S));
         assert!(should_aggregate(25000, Some(10000), INTERVAL_10S));
-    }
-
-    #[test]
-    fn test_parse_ifconfig_output() {
-        let output = r#"
-ppp0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
-        inet 10.0.0.1  netmask 255.255.255.0  broadcast 10.0.0.255
-        RX packets 12345  errors 10  dropped 5  overruns 2  frame 1
-        TX packets 9876  errors 5  dropped 3  overruns 1  carrier 0
-"#;
-
-        let stats = parse_ifconfig_output(output).unwrap();
-        assert!(stats.available);
-        assert_eq!(stats.rx_packets, Some(12345));
-        assert_eq!(stats.rx_dropped, Some(5));
-        assert_eq!(stats.tx_packets, Some(9876));
-        assert_eq!(stats.tx_dropped, Some(3));
     }
 }
