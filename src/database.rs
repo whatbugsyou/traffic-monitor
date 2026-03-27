@@ -327,22 +327,7 @@ impl Database {
         Ok(())
     }
 
-    /// 获取所有命名空间
-    pub fn get_namespaces(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().unwrap();
 
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT namespace FROM traffic_history ORDER BY namespace")
-            .context("Failed to prepare statement")?;
-
-        let namespaces = stmt
-            .query_map([], |row| row.get(0))
-            .context("Failed to query namespaces")?
-            .collect::<std::result::Result<Vec<String>, _>>()
-            .context("Failed to collect namespaces")?;
-
-        Ok(namespaces)
-    }
 
     /// 获取当前数据（最新的数据）
     pub fn get_current_data(&self, namespace: &str) -> Result<Option<TrafficData>> {
@@ -579,22 +564,6 @@ fn calculate_speeds_for_data_list(
                         iface.tx_speed = Some(tx_speed);
                     }
                 }
-
-                // 计算丢包增量
-                if data.ppp0.available && prev.ppp0.available {
-                    data.ppp0.rx_dropped_inc = Some(
-                        data.ppp0
-                            .rx_dropped
-                            .unwrap_or(0)
-                            .saturating_sub(prev.ppp0.rx_dropped.unwrap_or(0)),
-                    );
-                    data.ppp0.tx_dropped_inc = Some(
-                        data.ppp0
-                            .tx_dropped
-                            .unwrap_or(0)
-                            .saturating_sub(prev.ppp0.tx_dropped.unwrap_or(0)),
-                    );
-                }
             }
         }
 
@@ -635,7 +604,7 @@ mod tests {
                 rx_speed: None,
                 tx_speed: None,
             }],
-            ppp0: Ppp0Stats::unavailable(),
+
             resolution: Some("1s".to_string()),
         };
 

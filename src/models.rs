@@ -14,58 +14,6 @@ pub struct InterfaceStats {
     pub tx_speed: Option<u64>,
 }
 
-/// PPP0 接口统计信息
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ppp0Stats {
-    pub available: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_packets: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_errors: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_dropped: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_overruns: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_frame: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_packets: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_errors: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_dropped: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_overruns: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_carrier: Option<u64>,
-    /// 接收丢包增量，查询时计算
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_dropped_inc: Option<u64>,
-    /// 发送丢包增量，查询时计算
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_dropped_inc: Option<u64>,
-}
-
-impl Ppp0Stats {
-    pub fn unavailable() -> Self {
-        Ppp0Stats {
-            available: false,
-            rx_packets: None,
-            rx_errors: None,
-            rx_dropped: None,
-            rx_overruns: None,
-            rx_frame: None,
-            tx_packets: None,
-            tx_errors: None,
-            tx_dropped: None,
-            tx_overruns: None,
-            tx_carrier: None,
-            rx_dropped_inc: None,
-            tx_dropped_inc: None,
-        }
-    }
-}
-
 /// 流量数据（原始快照）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficData {
@@ -73,7 +21,6 @@ pub struct TrafficData {
     pub timestamp: String,
     pub timestamp_ms: i64,
     pub interfaces: Vec<InterfaceStats>,
-    pub ppp0: Ppp0Stats,
     /// 数据分辨率：1s, 10s, 1m
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
