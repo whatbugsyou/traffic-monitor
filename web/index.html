@@ -670,11 +670,11 @@
 
       const chart = echarts.init(document.getElementById(`container-${name}`));
       interfaceCharts[name] = chart;
-      interfaceData[name] = {labels: [], rx: [], tx: []};
+      interfaceData[name] = {labels: [], rx: [], tx: [], rxDrop: [], txDrop: []};
 
       chart.setOption({
         tooltip: {trigger: 'axis'},
-        legend: {data: ['下载', '上传'], top: 0},
+        legend: {data: ['下载', '上传', 'RX丢包', 'TX丢包'], top: 0},
         grid: {left: '3%', right: '4%', bottom: '3%', containLabel: true},
         xAxis: {
           type: 'category',
@@ -683,14 +683,24 @@
           // 3小时约10800个点，每600个点(10分钟)显示一个标签
           axisLabel: {interval: 599, rotate: 0}
         },
-        yAxis: {
-          type: 'value',
-          axisLabel: {formatter: (v) => v + ' KB/s'}
-        },
+        yAxis: [
+          {
+            type: 'value',
+            name: '速度',
+            position: 'left',
+            axisLabel: {formatter: (v) => v + ' KB/s'}
+          },
+          {
+            type: 'value',
+            name: '丢包',
+            position: 'right',
+            axisLabel: {formatter: (v) => v + ' 包/s'}
+          }
+        ],
         series: [
           {
             name: '下载', type: 'line', smooth: true, data: [],
-            // 大数据量优化：启用降采样
+            yAxisIndex: 0,
             sampling: 'lttb',
             large: true,
             largeThreshold: 1000,
@@ -707,6 +717,7 @@
           },
           {
             name: '上传', type: 'line', smooth: true, data: [],
+            yAxisIndex: 0,
             sampling: 'lttb',
             large: true,
             largeThreshold: 1000,
@@ -720,6 +731,24 @@
                 ]
               }
             }
+          },
+          {
+            name: 'RX丢包', type: 'line', smooth: true, data: [],
+            yAxisIndex: 1,
+            sampling: 'lttb',
+            large: true,
+            largeThreshold: 1000,
+            itemStyle: {color: '#ef4444'},
+            lineStyle: {type: 'dashed'}
+          },
+          {
+            name: 'TX丢包', type: 'line', smooth: true, data: [],
+            yAxisIndex: 1,
+            sampling: 'lttb',
+            large: true,
+            largeThreshold: 1000,
+            itemStyle: {color: '#f97316'},
+            lineStyle: {type: 'dashed'}
           }
         ]
       });
@@ -862,6 +891,9 @@
           const isLast = index === historyData.length - 1;
           const time = new Date(data.timestamp).toLocaleTimeString();
 
+          let totalRxDroppedSpeed = 0;
+          let totalTxDroppedSpeed = 0;
+
           (data.interfaces || []).forEach(iface => {
             const name = iface.name;
             createInterfaceChart(name);
@@ -873,20 +905,22 @@
             interfaceData[name].labels.push(time);
             interfaceData[name].rx.push((rxSpeed / 1024).toFixed(2));
             interfaceData[name].tx.push((txSpeed / 1024).toFixed(2));
+            interfaceData[name].rxDrop.push(iface.rx_dropped_speed || 0);
+            interfaceData[name].txDrop.push(iface.tx_dropped_speed || 0);
 
             if (isLast) {
               totalRxSpeed += rxSpeed;
               totalTxSpeed += txSpeed;
+              // 汇总所有接口的丢包速度
+              totalRxDroppedSpeed += iface.rx_dropped_speed || 0;
+              totalTxDroppedSpeed += iface.tx_dropped_speed || 0;
             }
           });
 
-          // 丢包数据（使用服务端计算的增量）
-          if (data.ppp0 && data.ppp0.available && data.ppp0.rx_dropped_inc !== undefined) {
-            const time = new Date(data.timestamp).toLocaleTimeString();
-            lossData.labels.push(time);
-            lossData.rxLoss.push(data.ppp0.rx_dropped_inc);
-            lossData.txLoss.push(data.ppp0.tx_dropped_inc);
-          }
+          // 丢包数据（汇总所有接口的丢包速度）
+          lossData.labels.push(time);
+          lossData.rxLoss.push(totalRxDroppedSpeed);
+          lossData.txLoss.push(totalTxDroppedSpeed);
         });
       }
 
@@ -896,7 +930,9 @@
           xAxis: {data: interfaceData[name].labels},
           series: [
             {data: interfaceData[name].rx},
-            {data: interfaceData[name].tx}
+            {data: interfaceData[name].tx},
+            {data: interfaceData[name].rxDrop},
+            {data: interfaceData[name].txDrop}
           ]
         });
       });
@@ -925,37 +961,25 @@
         document.getElementById('last-update').textContent = latest.timestamp;
         $dataPoints.textContent = `${historyData.length} 个数据点`;
 
-        if (latest.ppp0 && latest.ppp0.available) {
-          const ppp0El = document.getElementById('ppp0-status');
-          ppp0El.textContent = '正常运行';
-          ppp0El.className = 'ppp0-status available';
-
-          const rxRate = calcLossRate(
-            latest.ppp0.rx_packets, latest.ppp0.rx_errors,
-            latest.ppp0.rx_dropped, latest.ppp0.rx_overruns,
-            latest.ppp0.rx_frame ?? 0
-          );
-          const txRate = calcLossRate(
-            latest.ppp0.tx_packets, latest.ppp0.tx_errors,
-            latest.ppp0.tx_dropped, latest.ppp0.tx_overruns,
-            latest.ppp0.tx_carrier ?? 0
-          );
-          document.getElementById('rx-loss-rate-total').textContent = rxRate + '%';
-          document.getElementById('tx-loss-rate-total').textContent = txRate + '%';
-
-          if (lossData.rxLoss.length > 0) {
-            const lastRx = lossData.rxLoss[lossData.rxLoss.length - 1];
-            const lastTx = lossData.txLoss[lossData.txLoss.length - 1];
-            document.getElementById('rx-loss-per-sec').innerHTML = `${lastRx}<span class="stat-unit">包/秒</span>`;
-            document.getElementById('tx-loss-per-sec').innerHTML = `${lastTx}<span class="stat-unit">包/秒</span>`;
-            document.getElementById('rx-loss-per-sec-detail').textContent = lastRx;
-            document.getElementById('tx-loss-per-sec-detail').textContent = lastTx;
-          }
-        } else {
-          const ppp0El = document.getElementById('ppp0-status');
-          ppp0El.textContent = '不可用';
-          ppp0El.className = 'ppp0-status unavailable';
+        // 更新丢包统计（汇总所有接口）
+        if (lossData.rxLoss.length > 0) {
+          const lastRx = lossData.rxLoss[lossData.rxLoss.length - 1];
+          const lastTx = lossData.txLoss[lossData.txLoss.length - 1];
+          document.getElementById('rx-loss-per-sec').innerHTML = `${lastRx}<span class="stat-unit">包/秒</span>`;
+          document.getElementById('tx-loss-per-sec').innerHTML = `${lastTx}<span class="stat-unit">包/秒</span>`;
         }
+
+        // 计算所有接口的累计丢包率
+        let totalRxPackets = 0, totalTxPackets = 0;
+        let totalRxDropped = 0, totalTxDropped = 0;
+        (latest.interfaces || []).forEach(iface => {
+          totalRxDropped += iface.rx_dropped || 0;
+          totalTxDropped += iface.tx_dropped || 0;
+        });
+
+        // 隐藏 PPP0 专用区域（现在使用统一的丢包统计）
+        const ppp0Section = document.getElementById('ppp0-section');
+        if (ppp0Section) ppp0Section.style.display = 'none';
       }
     }
 

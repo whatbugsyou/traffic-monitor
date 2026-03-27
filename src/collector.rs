@@ -417,13 +417,19 @@ fn collect_interfaces_from_sysfs(
 
         let rx_bytes = read_sysfs_value(&stats_path.join("rx_bytes"))?;
         let tx_bytes = read_sysfs_value(&stats_path.join("tx_bytes"))?;
+        let rx_dropped = read_sysfs_value(&stats_path.join("rx_dropped"))?;
+        let tx_dropped = read_sysfs_value(&stats_path.join("tx_dropped"))?;
 
         interfaces.push(InterfaceStats {
             name: dev_name,
             rx_bytes,
             tx_bytes,
+            rx_dropped,
+            tx_dropped,
             rx_speed: None,
             tx_speed: None,
+            rx_dropped_speed: None,
+            tx_dropped_speed: None,
         });
     }
 

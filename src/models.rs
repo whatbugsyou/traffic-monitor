@@ -6,12 +6,22 @@ pub struct InterfaceStats {
     pub name: String,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// 接收丢包数（累计值）
+    pub rx_dropped: u64,
+    /// 发送丢包数（累计值）
+    pub tx_dropped: u64,
     /// 接收速度 (bytes/s)，查询时计算
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rx_speed: Option<u64>,
     /// 发送速度 (bytes/s)，查询时计算
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_speed: Option<u64>,
+    /// 接收丢包速度 (包/s)，查询时计算
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_dropped_speed: Option<u64>,
+    /// 发送丢包速度 (包/s)，查询时计算
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_dropped_speed: Option<u64>,
 }
 
 /// 数据分辨率
@@ -68,6 +78,7 @@ pub fn calculate_interface_speeds(current: &mut TrafficData, prev: Option<&Traff
         if interval_ms > 0 {
             for iface in &mut current.interfaces {
                 if let Some(prev_iface) = prev.interfaces.iter().find(|i| i.name == iface.name) {
+                    // 计算流量速度
                     let rx_speed = iface
                         .rx_bytes
                         .saturating_sub(prev_iface.rx_bytes)
@@ -81,6 +92,21 @@ pub fn calculate_interface_speeds(current: &mut TrafficData, prev: Option<&Traff
 
                     iface.rx_speed = Some(rx_speed);
                     iface.tx_speed = Some(tx_speed);
+
+                    // 计算丢包速度（每秒丢包数）
+                    let rx_dropped_speed = iface
+                        .rx_dropped
+                        .saturating_sub(prev_iface.rx_dropped)
+                        .saturating_mul(1000)
+                        / interval_ms as u64;
+                    let tx_dropped_speed = iface
+                        .tx_dropped
+                        .saturating_sub(prev_iface.tx_dropped)
+                        .saturating_mul(1000)
+                        / interval_ms as u64;
+
+                    iface.rx_dropped_speed = Some(rx_dropped_speed);
+                    iface.tx_dropped_speed = Some(tx_dropped_speed);
                 }
             }
         }
