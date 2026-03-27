@@ -125,7 +125,10 @@ async fn get_history_data(
     let duration_minutes = query.duration.unwrap_or(5);
 
     match db.get_history_by_duration(namespace, duration_minutes) {
-        Ok(data) => {
+        Ok(mut data) => {
+            // 计算速度
+            calculate_speeds_for_list(&mut data);
+
             let response = HistoryResponse {
                 namespace: namespace.to_string(),
                 duration_minutes,
@@ -143,6 +146,7 @@ async fn get_history_data(
 
 /// SSE 实时流
 async fn sse_stream(
+    db: web::Data<Arc<Database>>,
     collector: web::Data<Arc<TrafficCollector>>,
     query: web::Query<StreamQuery>,
 ) -> impl Responder {
@@ -171,17 +175,32 @@ async fn sse_stream(
         }
     };
 
-    // 创建 SSE 流（精准订阅，无需过滤）
+    // 从数据库获取最近一条数据作为 prev_data 的初始值
+    let initial_data = db.get_current_data(&namespace).ok().flatten();
+    if initial_data.is_some() {
+        log::debug!("SSE stream initialized with previous data for namespace: {}", namespace);
+    }
+
+    // 创建 SSE 流（精准订阅，计算速度后发送）
     let stream = async_stream::stream! {
         log::info!("SSE stream started for namespace: {}", namespace);
+        // 保存上一次的数据用于计算速度（初始化为数据库中的最新数据）
+        let mut prev_data = initial_data;
+
         loop {
             match receiver.recv().await {
-                Ok(data) => {
-                    // 精准订阅，直接发送数据
+                Ok(mut data) => {
+                    // 计算速度
+                    calculate_interface_speeds(&mut data, prev_data.as_ref());
+
+                    // 发送带速度的数据
                     let message = SseMessage {
                         message_type: "incremental".to_string(),
-                        data: vec![data],
+                        data: vec![data.clone()],
                     };
+
+                    // 更新 prev_data（保存当前数据用于下次计算）
+                    prev_data = Some(data);
 
                     if let Ok(json) = serde_json::to_string(&message) {
                         yield Ok(web::Bytes::from(format!("data: {}\n\n", json))) as Result<web::Bytes, std::convert::Infallible>;

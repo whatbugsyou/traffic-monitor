@@ -407,8 +407,8 @@ impl Database {
             .collect::<std::result::Result<Vec<String>, _>>()
             .context("Failed to collect raw history")?;
 
-        // 解析并计算速度
-        calculate_speeds_for_data_list(data_list, "1s")
+        // 解析原始数据
+        parse_data_list(data_list, "1s")
     }
 
     /// 获取1小时聚合历史数据（查询时计算速度）
@@ -436,8 +436,8 @@ impl Database {
             .collect::<std::result::Result<Vec<String>, _>>()
             .context("Failed to collect 1h aggregated history")?;
 
-        // 解析并计算速度
-        calculate_speeds_for_data_list(data_list, "1h")
+        // 解析原始数据
+        parse_data_list(data_list, "1h")
     }
 
     /// 获取1天聚合历史数据（查询时计算速度）
@@ -465,8 +465,8 @@ impl Database {
             .collect::<std::result::Result<Vec<String>, _>>()
             .context("Failed to collect 1d aggregated history")?;
 
-        // 解析并计算速度
-        calculate_speeds_for_data_list(data_list, "1d")
+        // 解析原始数据
+        parse_data_list(data_list, "1d")
     }
 
     /// 获取10秒聚合历史数据（查询时计算速度）
@@ -494,8 +494,8 @@ impl Database {
             .collect::<std::result::Result<Vec<String>, _>>()
             .context("Failed to collect 10s aggregated history")?;
 
-        // 解析并计算速度
-        calculate_speeds_for_data_list(data_list, "10s")
+        // 解析原始数据
+        parse_data_list(data_list, "10s")
     }
 
     /// 获取1分钟聚合历史数据（查询时计算速度）
@@ -523,55 +523,22 @@ impl Database {
             .collect::<std::result::Result<Vec<String>, _>>()
             .context("Failed to collect 1m aggregated history")?;
 
-        // 解析并计算速度
-        calculate_speeds_for_data_list(data_list, "1m")
+        // 解析原始数据
+        parse_data_list(data_list, "1m")
     }
 }
 
-/// 解析数据列表并计算速度（查询时计算）
-fn calculate_speeds_for_data_list(
-    data_json_list: Vec<String>,
-    resolution: &str,
-) -> Result<Vec<TrafficData>> {
-    let mut result = Vec::new();
-    let mut prev_data: Option<TrafficData> = None;
-
-    for data_json in data_json_list {
-        let mut data: TrafficData =
-            serde_json::from_str(&data_json).context("Failed to deserialize traffic data")?;
-
-        data.resolution = Some(resolution.to_string());
-
-        // 计算速度
-        if let Some(prev) = &prev_data {
-            let interval_ms = data.timestamp_ms - prev.timestamp_ms;
-            if interval_ms > 0 {
-                for iface in &mut data.interfaces {
-                    if let Some(prev_iface) = prev.interfaces.iter().find(|i| i.name == iface.name)
-                    {
-                        let rx_speed = iface
-                            .rx_bytes
-                            .saturating_sub(prev_iface.rx_bytes)
-                            .saturating_mul(1000)
-                            / interval_ms as u64;
-                        let tx_speed = iface
-                            .tx_bytes
-                            .saturating_sub(prev_iface.tx_bytes)
-                            .saturating_mul(1000)
-                            / interval_ms as u64;
-
-                        iface.rx_speed = Some(rx_speed);
-                        iface.tx_speed = Some(tx_speed);
-                    }
-                }
-            }
-        }
-
-        result.push(data.clone());
-        prev_data = Some(data);
-    }
-
-    Ok(result)
+/// 解析数据列表（只解析 JSON，不计算速度）
+fn parse_data_list(data_json_list: Vec<String>, resolution: &str) -> Result<Vec<TrafficData>> {
+    data_json_list
+        .into_iter()
+        .map(|data_json| {
+            let mut data: TrafficData =
+                serde_json::from_str(&data_json).context("Failed to deserialize traffic data")?;
+            data.resolution = Some(resolution.to_string());
+            Ok(data)
+        })
+        .collect()
 }
 
 #[cfg(test)]

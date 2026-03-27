@@ -61,6 +61,46 @@ pub struct TrafficData {
     pub resolution: Option<String>,
 }
 
+/// 计算接口速度（基于前后数据的字节差和时间差）
+pub fn calculate_interface_speeds(current: &mut TrafficData, prev: Option<&TrafficData>) {
+    if let Some(prev) = prev {
+        let interval_ms = current.timestamp_ms - prev.timestamp_ms;
+        if interval_ms > 0 {
+            for iface in &mut current.interfaces {
+                if let Some(prev_iface) = prev.interfaces.iter().find(|i| i.name == iface.name) {
+                    let rx_speed = iface
+                        .rx_bytes
+                        .saturating_sub(prev_iface.rx_bytes)
+                        .saturating_mul(1000)
+                        / interval_ms as u64;
+                    let tx_speed = iface
+                        .tx_bytes
+                        .saturating_sub(prev_iface.tx_bytes)
+                        .saturating_mul(1000)
+                        / interval_ms as u64;
+
+                    iface.rx_speed = Some(rx_speed);
+                    iface.tx_speed = Some(tx_speed);
+                }
+            }
+        }
+    }
+}
+
+/// 计算数据列表的速度（遍历列表，依次计算每条数据的速度）
+pub fn calculate_speeds_for_list(data_list: &mut [TrafficData]) {
+    for i in 0..data_list.len() {
+        if i > 0 {
+            // 获取前后数据的引用（需要 unsafe 因为 Rust 不允许同时可变和不可变引用）
+            // 使用 split_at_mut 来安全地分割切片
+            let (left, right) = data_list.split_at_mut(i);
+            let prev = &left[i - 1];
+            let current = &mut right[0];
+            calculate_interface_speeds(current, Some(prev));
+        }
+    }
+}
+
 /// 历史数据响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryResponse {
