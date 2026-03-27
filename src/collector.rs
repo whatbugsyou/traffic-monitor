@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
 
 use crate::database::Database;
 use crate::models::*;
+
+const INTERVAL_10S: i64 = 10_000; // 10秒（毫秒）
+const INTERVAL_1M: i64 = 60_000; // 1分钟（毫秒）
 
 /// 流量数据采集器
 pub struct TrafficCollector {
@@ -61,8 +63,8 @@ impl TrafficCollector {
         // 读取 /var/run/netns/ 目录
         let netns_dir = Path::new("/var/run/netns");
         if netns_dir.exists() {
-            let entries = fs::read_dir(netns_dir)
-                .context("Failed to read /var/run/netns directory")?;
+            let entries =
+                fs::read_dir(netns_dir).context("Failed to read /var/run/netns directory")?;
 
             for entry in entries.flatten() {
                 if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
@@ -138,26 +140,45 @@ impl TrafficCollector {
 
         tokio::spawn(async move {
             let mut collect_interval = interval(Duration::from_secs(config.interval_secs));
-            let mut prev_data: Option<TrafficData> = None;
+            let mut last_10s_ts: Option<i64> = None;
+            let mut last_1m_ts: Option<i64> = None;
 
             log::info!("Started collector for namespace: {}", namespace);
 
             loop {
                 tokio::select! {
                     _ = collect_interval.tick() => {
-                        match collect_namespace_data(&namespace, prev_data.as_ref()).await {
+                        match collect_namespace_data(&namespace).await {
                             Ok(data) => {
-                                // 存储到数据库
+                                let timestamp_ms = data.timestamp_ms;
+
+                                // 存储原始数据
                                 if let Err(e) = db.insert_traffic_data(&data) {
                                     log::error!("Failed to store data for {}: {}", namespace, e);
                                 }
 
-                                // 广播数据
-                                if let Err(e) = data_sender.send(data.clone()) {
-                                    log::error!("Failed to broadcast data for {}: {}", namespace, e);
+                                // 检查是否到达10秒聚合点
+                                if should_aggregate(timestamp_ms, last_10s_ts, INTERVAL_10S) {
+                                    if let Err(e) = db.insert_10s_aggregated(&data) {
+                                        log::error!("Failed to store 10s aggregated data for {}: {}", namespace, e);
+                                    }
+                                    last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
+                                    log::debug!("Saved 10s aggregated data for {} at {}", namespace, data.timestamp);
                                 }
 
-                                prev_data = Some(data);
+                                // 检查是否到达1分钟聚合点
+                                if should_aggregate(timestamp_ms, last_1m_ts, INTERVAL_1M) {
+                                    if let Err(e) = db.insert_1m_aggregated(&data) {
+                                        log::error!("Failed to store 1m aggregated data for {}: {}", namespace, e);
+                                    }
+                                    last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
+                                    log::debug!("Saved 1m aggregated data for {} at {}", namespace, data.timestamp);
+                                }
+
+                                // 广播数据
+                                if let Err(e) = data_sender.send(data) {
+                                    log::error!("Failed to broadcast data for {}: {}", namespace, e);
+                                }
                             }
                             Err(e) => {
                                 log::error!("Failed to collect data for {}: {}", namespace, e);
@@ -187,16 +208,30 @@ impl TrafficCollector {
 
     /// 停止采集器
     pub fn stop(&self) -> Result<()> {
-        self.shutdown.send(()).context("Failed to send shutdown signal")?;
+        self.shutdown
+            .send(())
+            .context("Failed to send shutdown signal")?;
         Ok(())
     }
 }
 
+/// 判断是否应该进行聚合
+fn should_aggregate(current_ts: i64, last_ts: Option<i64>, interval_ms: i64) -> bool {
+    let current_aligned = align_timestamp(current_ts, interval_ms);
+
+    match last_ts {
+        None => true,
+        Some(last) => current_aligned > last,
+    }
+}
+
+/// 将时间戳对齐到指定的聚合间隔
+fn align_timestamp(timestamp_ms: i64, interval_ms: i64) -> i64 {
+    (timestamp_ms / interval_ms) * interval_ms
+}
+
 /// 采集指定命名空间的数据
-async fn collect_namespace_data(
-    namespace: &str,
-    prev_data: Option<&TrafficData>,
-) -> Result<TrafficData> {
+async fn collect_namespace_data(namespace: &str) -> Result<TrafficData> {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let timestamp_ms = Utc::now().timestamp_millis();
 
@@ -206,7 +241,7 @@ async fn collect_namespace_data(
     // 采集 ppp0 数据
     let ppp0 = collect_ppp0_stats(namespace).await?;
 
-    let mut data = TrafficData {
+    let data = TrafficData {
         namespace: namespace.to_string(),
         timestamp,
         timestamp_ms,
@@ -214,11 +249,6 @@ async fn collect_namespace_data(
         ppp0,
         resolution: Some("1s".to_string()),
     };
-
-    // 计算速度（需要上一条数据）
-    if let Some(prev) = prev_data {
-        calculate_speeds(&mut data, prev);
-    }
 
     Ok(data)
 }
@@ -239,7 +269,10 @@ async fn collect_interfaces(namespace: &str) -> Result<Vec<InterfaceStats>> {
 }
 
 /// 从 sysfs 读取接口数据
-fn collect_interfaces_from_sysfs(base_path: &str, interfaces: &mut Vec<InterfaceStats>) -> Result<()> {
+fn collect_interfaces_from_sysfs(
+    base_path: &str,
+    interfaces: &mut Vec<InterfaceStats>,
+) -> Result<()> {
     let net_dir = Path::new(base_path);
 
     if !net_dir.exists() {
@@ -357,19 +390,22 @@ async fn collect_ppp0_stats(namespace: &str) -> Result<Ppp0Stats> {
     use std::process::Command;
 
     // 检查 ppp0 是否存在
-    let check_output = if namespace == "default" {
-        Command::new("test")
-            .args(["-d", "/sys/class/net/ppp0"])
-            .output()
-            .ok()
+    let ppp0_exists = if namespace == "default" {
+        Path::new("/sys/class/net/ppp0").exists()
     } else {
         Command::new("ip")
-            .args(["netns", "exec", namespace, "test", "-d", "/sys/class/net/ppp0"])
+            .args([
+                "netns",
+                "exec",
+                namespace,
+                "test",
+                "-d",
+                "/sys/class/net/ppp0",
+            ])
             .output()
-            .ok()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     };
-
-    let ppp0_exists = check_output.map(|o| o.status.success()).unwrap_or(false);
 
     if !ppp0_exists {
         return Ok(Ppp0Stats::unavailable());
@@ -432,71 +468,35 @@ fn read_sysfs_value(path: &Path) -> Result<u64> {
     Ok(value)
 }
 
-/// 计算速度
-fn calculate_speeds(current: &mut TrafficData, prev: &TrafficData) {
-    let interval_ms = current.timestamp_ms - prev.timestamp_ms;
-
-    if interval_ms <= 0 {
-        return;
-    }
-
-    // 计算接口速度
-    for iface in &mut current.interfaces {
-        if let Some(prev_iface) = prev.interfaces.iter().find(|i| i.name == iface.name) {
-            let rx_speed = iface
-                .rx_bytes
-                .saturating_sub(prev_iface.rx_bytes)
-                .saturating_mul(1000)
-                / interval_ms as u64;
-
-            let tx_speed = iface
-                .tx_bytes
-                .saturating_sub(prev_iface.tx_bytes)
-                .saturating_mul(1000)
-                / interval_ms as u64;
-
-            iface.rx_speed = Some(rx_speed);
-            iface.tx_speed = Some(tx_speed);
-        }
-    }
-
-    // 计算丢包增量
-    if current.ppp0.available && prev.ppp0.available {
-        current.ppp0.rx_dropped_inc = Some(
-            current
-                .ppp0
-                .rx_dropped
-                .unwrap_or(0)
-                .saturating_sub(prev.ppp0.rx_dropped.unwrap_or(0)),
-        );
-
-        current.ppp0.tx_dropped_inc = Some(
-            current
-                .ppp0
-                .tx_dropped
-                .unwrap_or(0)
-                .saturating_sub(prev.ppp0.tx_dropped.unwrap_or(0)),
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_discover_namespaces() {
-        let config = DatabaseConfig::default();
-        let db = Arc::new(Database::new(config).unwrap());
+    #[test]
+    fn test_align_timestamp() {
+        // 测试10秒对齐
+        assert_eq!(align_timestamp(12345, INTERVAL_10S), 10000);
+        assert_eq!(align_timestamp(19999, INTERVAL_10S), 10000);
+        assert_eq!(align_timestamp(20000, INTERVAL_10S), 20000);
 
-        let collector_config = CollectorConfig::default();
-        let collector = TrafficCollector::new(db, collector_config).unwrap();
+        // 测试1分钟对齐
+        assert_eq!(align_timestamp(12345, INTERVAL_1M), 0);
+        assert_eq!(align_timestamp(60000, INTERVAL_1M), 60000);
+        assert_eq!(align_timestamp(119999, INTERVAL_1M), 60000);
+        assert_eq!(align_timestamp(120000, INTERVAL_1M), 120000);
+    }
 
-        collector.discover_namespaces().await.unwrap();
+    #[test]
+    fn test_should_aggregate() {
+        // 第一次应该聚合
+        assert!(should_aggregate(10000, None, INTERVAL_10S));
 
-        let namespaces = collector.get_namespaces().await;
-        assert!(!namespaces.is_empty());
-        assert!(namespaces.contains(&"default".to_string()));
+        // 同一个时间窗口内不应该再次聚合
+        assert!(!should_aggregate(15000, Some(10000), INTERVAL_10S));
+
+        // 进入下一个时间窗口应该聚合
+        assert!(should_aggregate(20000, Some(10000), INTERVAL_10S));
+        assert!(should_aggregate(25000, Some(10000), INTERVAL_10S));
     }
 
     #[test]
