@@ -1,7 +1,7 @@
 use actix_cors::Cors;
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
-use actix_web::http::header;
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -42,7 +42,7 @@ impl HttpServerWrapper {
         log::info!("  GET /api/history?namespace=<ns>&duration=<min> - Historical data");
         log::info!("  GET /api/stream?namespace=<ns>   - SSE real-time stream");
 
-        HttpServer::new(move || {
+        let server = HttpServer::new(move || {
             let cors = Cors::default()
                 .allow_any_origin()
                 .allow_any_method()
@@ -62,9 +62,10 @@ impl HttpServerWrapper {
         })
         .bind(format!("{}:{}", host, port))
         .context("Failed to bind HTTP server")?
-        .run()
-        .await
-        .context("Failed to run HTTP server")?;
+        .workers(2);
+
+        // 使用 actix 内置的优雅关闭
+        server.run().await.context("Failed to run HTTP server")?;
 
         Ok(())
     }
@@ -74,7 +75,7 @@ impl HttpServerWrapper {
 async fn index_handler() -> impl Responder {
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
-        .body(include_str!("../../web/index.html"))
+        .body(include_str!("../web/index.html"))
 }
 
 /// 获取命名空间列表
@@ -100,7 +101,9 @@ async fn get_current_data(
 
     match db.get_current_data(namespace) {
         Ok(Some(data)) => HttpResponse::Ok().json(data),
-        Ok(None) => HttpResponse::NotFound().body(format!("No data found for namespace: {}", namespace)),
+        Ok(None) => {
+            HttpResponse::NotFound().body(format!("No data found for namespace: {}", namespace))
+        }
         Err(e) => {
             log::error!("Failed to get current data for {}: {}", namespace, e);
             HttpResponse::InternalServerError().body(format!("Failed to get current data: {}", e))
@@ -156,7 +159,7 @@ async fn sse_stream(
                         };
 
                         if let Ok(json) = serde_json::to_string(&message) {
-                            yield Ok(web::Bytes::from(format!("data: {}\n\n", json)));
+                            yield Ok(web::Bytes::from(format!("data: {}\n\n", json))) as Result<web::Bytes, std::convert::Infallible>;
                         }
                     }
                 }
