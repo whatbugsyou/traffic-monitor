@@ -46,6 +46,8 @@ cargo clippy           # 代码检查
 
 ### 生产部署
 
+#### 方式一：动态链接（需要较新的系统）
+
 ```bash
 # 构建发布版本
 cargo build --release
@@ -54,6 +56,41 @@ cargo build --release
 sudo make install
 sudo systemctl start traffic-monitor
 ```
+
+#### 方式二：静态链接（推荐，兼容旧系统）
+
+对于 CentOS 7.6 等使用旧版 GLIBC 的系统，需要使用 musl 静态编译：
+
+```bash
+# 安装 musl 工具链（Debian/Ubuntu）
+apt-get install musl-tools musl-dev
+
+# 构建 musl 静态链接版本
+./build.sh musl
+
+# 生成的二进制文件位于：
+# target/x86_64-unknown-linux-musl/release/traffic-monitor
+```
+
+**部署到目标服务器：**
+
+```bash
+# 复制二进制文件和资源目录
+scp target/x86_64-unknown-linux-musl/release/traffic-monitor user@server:/path/
+scp -r data web user@server:/path/
+
+# 在目标服务器运行
+chmod +x traffic-monitor && ./traffic-monitor
+```
+
+#### 构建方式对比
+
+| 构建方式 | 命令 | 输出路径 | 兼容性 |
+|---------|------|---------|--------|
+| 动态链接 | `cargo build --release` | `target/release/` | 需要 GLIBC 2.29+ |
+| 静态链接 | `./build.sh musl` | `target/x86_64-unknown-linux-musl/release/` | 兼容所有 x86_64 Linux |
+
+> **提示**: 如果遇到 `GLIBC_2.29 not found` 等错误，请使用 musl 静态编译。
 
 ### 服务管理
 
