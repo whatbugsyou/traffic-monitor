@@ -97,7 +97,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             host: "0.0.0.0".to_string(),
-            port: 8080,
+            port: 18080,
             web_root: "web".to_string(),
         }
     }

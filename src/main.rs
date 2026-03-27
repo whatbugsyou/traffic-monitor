@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
 
     let server_config = ServerConfig {
         host: "0.0.0.0".to_string(),
-        port: 8080,
+        port: 18080,
         web_root: "web".to_string(),
     };
 
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     log::info!("========================================");
     log::info!("All services started successfully!");
     log::info!("========================================");
-    log::info!("Backend API: http://localhost:8080");
+    log::info!("Backend API: http://localhost:18080");
     log::info!("Web interface: Open web/index.html in browser");
     log::info!("");
     log::info!("API Endpoints:");
