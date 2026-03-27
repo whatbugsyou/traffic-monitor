@@ -413,9 +413,15 @@ impl Database {
         } else if duration_minutes <= 60 {
             // 1小时内：使用10秒聚合数据
             self.get_10s_aggregated_history(namespace, since_ms)
-        } else {
-            // 超过1小时：使用1分钟聚合数据
+        } else if duration_minutes <= 180 {
+            // 3小时内：使用1分钟聚合数据
             self.get_1m_aggregated_history(namespace, since_ms)
+        } else if duration_minutes <= 1440 {
+            // 24小时内：使用1小时聚合数据
+            self.get_1h_aggregated_history(namespace, since_ms)
+        } else {
+            // 超过24小时：使用1天聚合数据
+            self.get_1d_aggregated_history(namespace, since_ms)
         }
     }
 
@@ -442,6 +448,64 @@ impl Database {
 
         // 解析并计算速度
         calculate_speeds_for_data_list(data_list, "1s")
+    }
+
+    /// 获取1小时聚合历史数据（查询时计算速度）
+    fn get_1h_aggregated_history(
+        &self,
+        namespace: &str,
+        since_ms: i64,
+    ) -> Result<Vec<TrafficData>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT data FROM traffic_history_1h
+             WHERE namespace = ?1 AND timestamp_ms > ?2
+             ORDER BY timestamp_ms ASC",
+            )
+            .context("Failed to prepare statement")?;
+
+        let data_list = stmt
+            .query_map(params![namespace, since_ms], |row| {
+                let data_json: String = row.get(0)?;
+                Ok(data_json)
+            })
+            .context("Failed to query 1h aggregated history")?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .context("Failed to collect 1h aggregated history")?;
+
+        // 解析并计算速度
+        calculate_speeds_for_data_list(data_list, "1h")
+    }
+
+    /// 获取1天聚合历史数据（查询时计算速度）
+    fn get_1d_aggregated_history(
+        &self,
+        namespace: &str,
+        since_ms: i64,
+    ) -> Result<Vec<TrafficData>> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT data FROM traffic_history_1d
+             WHERE namespace = ?1 AND timestamp_ms > ?2
+             ORDER BY timestamp_ms ASC",
+            )
+            .context("Failed to prepare statement")?;
+
+        let data_list = stmt
+            .query_map(params![namespace, since_ms], |row| {
+                let data_json: String = row.get(0)?;
+                Ok(data_json)
+            })
+            .context("Failed to query 1d aggregated history")?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .context("Failed to collect 1d aggregated history")?;
+
+        // 解析并计算速度
+        calculate_speeds_for_data_list(data_list, "1d")
     }
 
     /// 获取10秒聚合历史数据（查询时计算速度）
