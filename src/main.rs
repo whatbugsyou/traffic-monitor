@@ -30,12 +30,7 @@ async fn main() -> Result<()> {
         retention_1d_days: 30,
     };
 
-    let collector_config = CollectorConfig {
-        interval_secs: 1,
-        batch_size: 100,
-        max_retries: 3,
-        retry_delay_ms: 100,
-    };
+    let collector_config = CollectorConfig { interval_secs: 1 };
 
     let server_config = ServerConfig {
         host: "0.0.0.0".to_string(),

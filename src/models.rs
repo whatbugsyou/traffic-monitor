@@ -130,19 +130,11 @@ impl Default for DatabaseConfig {
 #[derive(Debug, Clone)]
 pub struct CollectorConfig {
     pub interval_secs: u64,
-    pub batch_size: usize,
-    pub max_retries: u32,
-    pub retry_delay_ms: u64,
 }
 
 impl Default for CollectorConfig {
     fn default() -> Self {
-        CollectorConfig {
-            interval_secs: 1,
-            batch_size: 100,
-            max_retries: 3,
-            retry_delay_ms: 100,
-        }
+        CollectorConfig { interval_secs: 1 }
     }
 }
 

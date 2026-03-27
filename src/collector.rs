@@ -223,11 +223,6 @@ impl TrafficCollector {
         self.data_sender.subscribe()
     }
 
-    /// 获取命名空间列表
-    pub async fn get_namespaces(&self) -> Vec<String> {
-        self.namespaces.read().await.clone()
-    }
-
     /// 停止采集器
     pub fn stop(&self) -> Result<()> {
         self.shutdown

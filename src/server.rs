@@ -210,9 +210,6 @@ mod tests {
         let config = DatabaseConfig::default();
         let db = Arc::new(Database::new(config).unwrap());
 
-        let collector_config = CollectorConfig::default();
-        let collector = Arc::new(TrafficCollector::new(Arc::clone(&db), collector_config).unwrap());
-
         let app = App::new()
             .app_data(web::Data::new(db))
             .route("/api/namespaces", web::get().to(get_namespaces));

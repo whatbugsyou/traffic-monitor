@@ -259,30 +259,6 @@ impl Database {
         Ok(())
     }
 
-    /// 批量插入原始流量数据
-    pub fn batch_insert_traffic_data(&self, data_list: &[TrafficData]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let tx = conn
-            .unchecked_transaction()
-            .context("Failed to start transaction")?;
-
-        for data in data_list {
-            let data_json =
-                serde_json::to_string(data).context("Failed to serialize traffic data")?;
-
-            tx.execute(
-                "INSERT OR REPLACE INTO traffic_history
-                 (namespace, timestamp, timestamp_ms, data)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![data.namespace, data.timestamp, data.timestamp_ms, data_json],
-            )
-            .context("Failed to insert traffic data in batch")?;
-        }
-
-        tx.commit().context("Failed to commit transaction")?;
-        Ok(())
-    }
-
     /// 插入10秒聚合数据（原始快照）
     pub fn insert_10s_aggregated(&self, data: &TrafficData) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -565,133 +541,6 @@ impl Database {
         // 解析并计算速度
         calculate_speeds_for_data_list(data_list, "1m")
     }
-
-    /// 获取指定时间范围内的原始数据（用于聚合判断）
-    pub fn get_raw_data_for_aggregation(
-        &self,
-        namespace: &str,
-        since_ms: i64,
-    ) -> Result<Vec<TrafficData>> {
-        let conn = self.conn.lock().unwrap();
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT data FROM traffic_history
-             WHERE namespace = ?1 AND timestamp_ms > ?2
-             ORDER BY timestamp_ms ASC",
-            )
-            .context("Failed to prepare statement")?;
-
-        let data_list = stmt
-            .query_map(params![namespace, since_ms], |row| {
-                let data_json: String = row.get(0)?;
-                Ok(data_json)
-            })
-            .context("Failed to query raw data for aggregation")?
-            .collect::<std::result::Result<Vec<String>, _>>()
-            .context("Failed to collect raw data for aggregation")?;
-
-        data_list
-            .into_iter()
-            .map(|data_json| {
-                serde_json::from_str(&data_json).context("Failed to deserialize traffic data")
-            })
-            .collect()
-    }
-
-    /// 清理旧数据
-    pub fn cleanup_old_data(&self, hours: u32) -> Result<usize> {
-        let cutoff_ms = Utc::now().timestamp_millis() - (hours as i64 * 60 * 60 * 1000);
-
-        let conn = self.conn.lock().unwrap();
-
-        let deleted_raw = conn
-            .execute(
-                "DELETE FROM traffic_history WHERE timestamp_ms < ?1",
-                params![cutoff_ms],
-            )
-            .context("Failed to cleanup traffic_history")?;
-
-        let deleted_10s = conn
-            .execute(
-                "DELETE FROM traffic_history_10s WHERE timestamp_ms < ?1",
-                params![cutoff_ms],
-            )
-            .context("Failed to cleanup traffic_history_10s")?;
-
-        let deleted_1m = conn
-            .execute(
-                "DELETE FROM traffic_history_1m WHERE timestamp_ms < ?1",
-                params![cutoff_ms],
-            )
-            .context("Failed to cleanup traffic_history_1m")?;
-
-        let deleted_1h = conn
-            .execute(
-                "DELETE FROM traffic_history_1h WHERE timestamp_ms < ?1",
-                params![cutoff_ms],
-            )
-            .context("Failed to cleanup traffic_history_1h")?;
-
-        let deleted_1d = conn
-            .execute(
-                "DELETE FROM traffic_history_1d WHERE timestamp_ms < ?1",
-                params![cutoff_ms],
-            )
-            .context("Failed to cleanup traffic_history_1d")?;
-
-        Ok(deleted_raw + deleted_10s + deleted_1m + deleted_1h + deleted_1d)
-    }
-
-    /// 获取数据库统计信息
-    pub fn get_stats(&self) -> Result<DatabaseStats> {
-        let conn = self.conn.lock().unwrap();
-
-        let raw_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM traffic_history", [], |row| row.get(0))
-            .unwrap_or(0);
-
-        let aggregated_10s_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM traffic_history_10s", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-
-        let aggregated_1m_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM traffic_history_1m", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-
-        let aggregated_1h_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM traffic_history_1h", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-
-        let aggregated_1d_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM traffic_history_1d", [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
-
-        let namespace_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT namespace) FROM traffic_history",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        Ok(DatabaseStats {
-            raw_count,
-            aggregated_10s_count,
-            aggregated_1m_count,
-            aggregated_1h_count,
-            aggregated_1d_count,
-            namespace_count,
-        })
-    }
 }
 
 /// 解析数据列表并计算速度（查询时计算）
@@ -754,17 +603,6 @@ fn calculate_speeds_for_data_list(
     }
 
     Ok(result)
-}
-
-/// 数据库统计信息
-#[derive(Debug, Clone)]
-pub struct DatabaseStats {
-    pub raw_count: i64,
-    pub aggregated_10s_count: i64,
-    pub aggregated_1m_count: i64,
-    pub aggregated_1h_count: i64,
-    pub aggregated_1d_count: i64,
-    pub namespace_count: i64,
 }
 
 #[cfg(test)]
