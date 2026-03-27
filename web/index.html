@@ -982,7 +982,7 @@
         console.log('[API] 收到数据:', result.count, '条, 分辨率:', result.data.length > 0 ? result.data[0].resolution : 'N/A');
 
         clearCharts();
-        processHistoryData(result.data || [], true);
+        processHistoryData(result.data || [], false);
         showDataUI();
 
         return result;
@@ -1071,7 +1071,8 @@
     async function loadNamespaces() {
       const res = await fetch(`${baseUrl}/api/namespaces`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const list = await res.json();
+      const data = await res.json();
+      const list = data.namespaces || data;
       if (!Array.isArray(list) || list.length === 0) throw new Error('命名空间列表为空');
       return list;
     }
