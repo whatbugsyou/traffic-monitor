@@ -1,0 +1,26 @@
+# Cargo 配置文件 - 使用官方 crates.io（通过代理访问）
+
+[source.crates-io]
+# 使用官方源，代理软件会处理网络请求
+# 如果代理软件对 crates.io 支持良好，应该可以正常工作
+
+# 网络配置
+[net]
+retry = 5
+git-fetch-with-cli = true
+
+# 编译配置
+[build]
+# 使用所有 CPU 核心
+jobs = 8
+
+# 交叉编译配置 - 使用 musl-cross 工具链
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+
+# 如果官方源仍然无法访问，可以尝试以下镜像源（取消注释）：
+# [source.crates-io]
+# replace-with = "rsproxy"
+#
+# [source.rsproxy]
+# registry = "https://rsproxy.cn/crates.io-index"
