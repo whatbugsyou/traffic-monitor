@@ -14,6 +14,41 @@ pub struct InterfaceStats {
     pub tx_speed: Option<u64>,
 }
 
+/// 数据分辨率
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Resolution {
+    /// 实时数据（1秒粒度）
+    Realtime,
+    /// 10秒聚合
+    TenSeconds,
+    /// 1分钟聚合
+    OneMinute,
+    /// 1小时聚合
+    OneHour,
+}
+
+impl Resolution {
+    /// 从时间跨度（分钟）推导合适的分辨率
+    pub fn from_duration_minutes(duration_minutes: u32) -> Self {
+        match duration_minutes {
+            0..=5 => Resolution::Realtime,      // ≤ 5分钟：实时数据
+            6..=60 => Resolution::TenSeconds,   // 5-60分钟：10秒聚合
+            61..=1440 => Resolution::OneMinute, // 1-24小时：1分钟聚合
+            _ => Resolution::OneHour,           // > 24小时：1小时聚合
+        }
+    }
+
+    /// 获取分辨率的字符串表示
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Resolution::Realtime => "1s",
+            Resolution::TenSeconds => "10s",
+            Resolution::OneMinute => "1m",
+            Resolution::OneHour => "1h",
+        }
+    }
+}
+
 /// 流量数据（原始快照）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficData {

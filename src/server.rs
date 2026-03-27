@@ -9,6 +9,8 @@ use crate::collector::TrafficCollector;
 use crate::database::Database;
 use crate::models::*;
 
+
+
 /// HTTP 服务器
 pub struct HttpServerWrapper {
     config: ServerConfig,
@@ -37,10 +39,10 @@ impl HttpServerWrapper {
         log::info!("Starting HTTP server on {}:{}", host, port);
         log::info!("Web root: {}", web_root);
         log::info!("API endpoints:");
-        log::info!("  GET /api/namespaces              - List namespaces");
-        log::info!("  GET /api/current?namespace=<ns>  - Current data");
-        log::info!("  GET /api/history?namespace=<ns>&duration=<min> - Historical data");
-        log::info!("  GET /api/stream?namespace=<ns>   - SSE real-time stream");
+        log::info!("  GET /api/namespaces                      - List namespaces");
+        log::info!("  GET /api/current?namespace=<ns>          - Current data");
+        log::info!("  GET /api/history?namespace=<ns>&duration=<min>&resolution=<res> - Historical data");
+        log::info!("  GET /api/stream?namespace=<ns>&duration=<min>&resolution=<res> - SSE real-time stream");
 
         let server = HttpServer::new(move || {
             let cors = Cors::default()
@@ -135,10 +137,20 @@ async fn sse_stream(
     query: web::Query<StreamQuery>,
 ) -> impl Responder {
     let namespace = query.namespace.as_deref().unwrap_or("default").to_string();
-    log::info!("SSE stream connected for namespace: {}", namespace);
+    let duration_minutes = query.duration.unwrap_or(5);
 
-    // 精准订阅指定命名空间的数据流
-    let receiver = collector.subscribe(&namespace).await;
+    // 根据时间跨度推导数据分辨率
+    let resolution = Resolution::from_duration_minutes(duration_minutes);
+
+    log::info!(
+        "SSE stream connected for namespace: {}, duration: {}min, resolution: {:?}",
+        namespace,
+        duration_minutes,
+        resolution
+    );
+
+    // 精准订阅指定命名空间和分辨率的数据流
+    let receiver = collector.subscribe(&namespace, resolution).await;
 
     // 如果命名空间不存在，返回错误
     let mut receiver = match receiver {
@@ -195,6 +207,7 @@ struct CurrentQuery {
 #[derive(Debug, Deserialize)]
 struct HistoryQuery {
     namespace: Option<String>,
+    /// 时间跨度（分钟）
     duration: Option<u32>,
 }
 
@@ -202,6 +215,8 @@ struct HistoryQuery {
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     namespace: Option<String>,
+    /// 时间跨度（分钟），后端根据时间跨度决定推送数据的分辨率
+    duration: Option<u32>,
 }
 
 #[cfg(test)]

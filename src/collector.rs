@@ -16,13 +16,56 @@ const INTERVAL_1M: i64 = 60_000; // 1分钟（毫秒）
 const INTERVAL_1H: i64 = 3_600_000; // 1小时（毫秒）
 const INTERVAL_1D: i64 = 86_400_000; // 1天（毫秒）
 
+/// 每个命名空间的多粒度广播通道
+struct ResolutionChannels {
+    /// 实时数据通道（1秒粒度）
+    realtime: broadcast::Sender<TrafficData>,
+    /// 10秒聚合通道
+    agg_10s: broadcast::Sender<TrafficData>,
+    /// 1分钟聚合通道
+    agg_1m: broadcast::Sender<TrafficData>,
+    /// 1小时聚合通道
+    agg_1h: broadcast::Sender<TrafficData>,
+}
+
+impl ResolutionChannels {
+    fn new() -> Self {
+        let (realtime, _) = broadcast::channel(100);
+        let (agg_10s, _) = broadcast::channel(100);
+        let (agg_1m, _) = broadcast::channel(100);
+        let (agg_1h, _) = broadcast::channel(100);
+
+        ResolutionChannels {
+            realtime,
+            agg_10s,
+            agg_1m,
+            agg_1h,
+        }
+    }
+
+    /// 获取指定分辨率的发送器
+    fn get_sender(&self, resolution: Resolution) -> &broadcast::Sender<TrafficData> {
+        match resolution {
+            Resolution::Realtime => &self.realtime,
+            Resolution::TenSeconds => &self.agg_10s,
+            Resolution::OneMinute => &self.agg_1m,
+            Resolution::OneHour => &self.agg_1h,
+        }
+    }
+
+    /// 订阅指定分辨率的数据
+    fn subscribe(&self, resolution: Resolution) -> broadcast::Receiver<TrafficData> {
+        self.get_sender(resolution).subscribe()
+    }
+}
+
 /// 流量数据采集器
 pub struct TrafficCollector {
     db: Arc<Database>,
     config: CollectorConfig,
     namespaces: Arc<RwLock<Vec<String>>>,
-    /// 每个命名空间独立的广播通道，实现精准订阅
-    data_senders: Arc<RwLock<HashMap<String, broadcast::Sender<TrafficData>>>>,
+    /// 每个命名空间的多粒度广播通道
+    channels: Arc<RwLock<HashMap<String, ResolutionChannels>>>,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -30,15 +73,14 @@ impl TrafficCollector {
     /// 创建新的采集器
     pub fn new(db: Arc<Database>, config: CollectorConfig) -> Result<Self> {
         let (shutdown, _) = broadcast::channel(1);
-
         let namespaces = Arc::new(RwLock::new(Vec::new()));
-        let data_senders = Arc::new(RwLock::new(HashMap::new()));
+        let channels = Arc::new(RwLock::new(HashMap::new()));
 
         Ok(TrafficCollector {
             db,
             config,
             namespaces,
-            data_senders,
+            channels,
             shutdown,
         })
     }
@@ -48,15 +90,14 @@ impl TrafficCollector {
         // 发现所有命名空间
         self.discover_namespaces().await?;
 
-        // 为每个命名空间创建广播通道
+        // 为每个命名空间创建多粒度广播通道
         {
             let namespaces = self.namespaces.read().await;
-            let mut senders = self.data_senders.write().await;
+            let mut channels = self.channels.write().await;
             for namespace in namespaces.iter() {
-                if !senders.contains_key(namespace) {
-                    let (sender, _) = broadcast::channel(100);
-                    senders.insert(namespace.clone(), sender);
-                    log::info!("Created broadcast channel for namespace: {}", namespace);
+                if !channels.contains_key(namespace) {
+                    channels.insert(namespace.clone(), ResolutionChannels::new());
+                    log::info!("Created multi-resolution channels for namespace: {}", namespace);
                 }
             }
         }
@@ -105,7 +146,7 @@ impl TrafficCollector {
     /// 启动命名空间发现任务
     async fn start_namespace_discovery(&self) -> Result<()> {
         let namespaces = Arc::clone(&self.namespaces);
-        let data_senders = Arc::clone(&self.data_senders);
+        let channels = Arc::clone(&self.channels);
         let mut shutdown_rx = self.shutdown.subscribe();
 
         tokio::spawn(async move {
@@ -136,13 +177,12 @@ impl TrafficCollector {
                         if *ns_guard != new_namespaces {
                             log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, new_namespaces);
 
-                            // 为新命名空间创建广播通道
-                            let mut senders = data_senders.write().await;
+                            // 为新命名空间创建通道
+                            let mut ch = channels.write().await;
                             for namespace in &new_namespaces {
-                                if !senders.contains_key(namespace) {
-                                    let (sender, _) = broadcast::channel(100);
-                                    senders.insert(namespace.clone(), sender);
-                                    log::info!("Created broadcast channel for new namespace: {}", namespace);
+                                if !ch.contains_key(namespace) {
+                                    ch.insert(namespace.clone(), ResolutionChannels::new());
+                                    log::info!("Created channels for new namespace: {}", namespace);
                                 }
                             }
 
@@ -163,7 +203,7 @@ impl TrafficCollector {
     /// 启动单个命名空间的采集任务
     async fn start_namespace_collector(&self, namespace: String) -> Result<()> {
         let db = Arc::clone(&self.db);
-        let data_senders = Arc::clone(&self.data_senders);
+        let channels = Arc::clone(&self.channels);
         let mut shutdown_rx = self.shutdown.subscribe();
         let config = self.config.clone();
         let namespace_clone = namespace.clone();
@@ -181,7 +221,7 @@ impl TrafficCollector {
                 tokio::select! {
                     _ = collect_interval.tick() => {
                         match collect_namespace_data(&namespace_clone).await {
-                            Ok(data) => {
+                            Ok(mut data) => {
                                 let timestamp_ms = data.timestamp_ms;
 
                                 // 存储原始数据
@@ -189,54 +229,59 @@ impl TrafficCollector {
                                     log::error!("Failed to store data for {}: {}", namespace_clone, e);
                                 }
 
-                                // 检查是否到达10秒聚合点
-                                if should_aggregate(timestamp_ms, last_10s_ts, INTERVAL_10S) {
-                                    if let Err(e) = db.insert_10s_aggregated(&data) {
-                                        log::error!("Failed to store 10s aggregated data for {}: {}", namespace_clone, e);
-                                    }
-                                    last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
-                                    log::debug!("Saved 10s aggregated data for {} at {}", namespace_clone, data.timestamp);
-                                }
+                                // 获取该命名空间的通道
+                                let ch = channels.read().await;
+                                if let Some(channels) = ch.get(&namespace_clone) {
+                                    // 发送实时数据（每秒）
+                                    data.resolution = Some("1s".to_string());
+                                    let _ = channels.realtime.send(data.clone());
 
-                                // 检查是否到达1分钟聚合点
-                                if should_aggregate(timestamp_ms, last_1m_ts, INTERVAL_1M) {
-                                    if let Err(e) = db.insert_1m_aggregated(&data) {
-                                        log::error!("Failed to store 1m aggregated data for {}: {}", namespace_clone, e);
-                                    }
-                                    last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
-                                    log::debug!("Saved 1m aggregated data for {} at {}", namespace_clone, data.timestamp);
-                                }
-
-                                // 检查是否到达1小时聚合点
-                                if should_aggregate(timestamp_ms, last_1h_ts, INTERVAL_1H) {
-                                    if let Err(e) = db.insert_1h_aggregated(&data) {
-                                        log::error!("Failed to store 1h aggregated data for {}: {}", namespace_clone, e);
-                                    }
-                                    last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
-                                    log::debug!("Saved 1h aggregated data for {} at {}", namespace_clone, data.timestamp);
-                                }
-
-                                // 检查是否到达1天聚合点
-                                if should_aggregate(timestamp_ms, last_1d_ts, INTERVAL_1D) {
-                                    if let Err(e) = db.insert_1d_aggregated(&data) {
-                                        log::error!("Failed to store 1d aggregated data for {}: {}", namespace_clone, e);
-                                    }
-                                    last_1d_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1D));
-                                    log::debug!("Saved 1d aggregated data for {} at {}", namespace_clone, data.timestamp);
-                                }
-
-                                // 向该命名空间的订阅者广播数据
-                                let senders = data_senders.read().await;
-                                if let Some(sender) = senders.get(&namespace_clone) {
-                                    match sender.send(data.clone()) {
-                                        Ok(subscriber_count) => {
-                                            if subscriber_count > 0 {
-                                                log::debug!("Broadcasting data for namespace {} to {} subscribers", namespace_clone, subscriber_count);
-                                            }
+                                    // 检查是否到达10秒聚合点
+                                    if should_aggregate(timestamp_ms, last_10s_ts, INTERVAL_10S) {
+                                        if let Err(e) = db.insert_10s_aggregated(&data) {
+                                            log::error!("Failed to store 10s aggregated data for {}: {}", namespace_clone, e);
                                         }
-                                        Err(e) => {
-                                            log::debug!("Failed to broadcast data for namespace {}: {}", namespace_clone, e);
+                                        last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
+
+                                        // 发送10秒聚合数据
+                                        data.resolution = Some("10s".to_string());
+                                        let _ = channels.agg_10s.send(data.clone());
+                                        log::debug!("Sent 10s aggregated data for {}", namespace_clone);
+                                    }
+
+                                    // 检查是否到达1分钟聚合点
+                                    if should_aggregate(timestamp_ms, last_1m_ts, INTERVAL_1M) {
+                                        if let Err(e) = db.insert_1m_aggregated(&data) {
+                                            log::error!("Failed to store 1m aggregated data for {}: {}", namespace_clone, e);
                                         }
+                                        last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
+
+                                        // 发送1分钟聚合数据
+                                        data.resolution = Some("1m".to_string());
+                                        let _ = channels.agg_1m.send(data.clone());
+                                        log::debug!("Sent 1m aggregated data for {}", namespace_clone);
+                                    }
+
+                                    // 检查是否到达1小时聚合点
+                                    if should_aggregate(timestamp_ms, last_1h_ts, INTERVAL_1H) {
+                                        if let Err(e) = db.insert_1h_aggregated(&data) {
+                                            log::error!("Failed to store 1h aggregated data for {}: {}", namespace_clone, e);
+                                        }
+                                        last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
+
+                                        // 发送1小时聚合数据
+                                        data.resolution = Some("1h".to_string());
+                                        let _ = channels.agg_1h.send(data.clone());
+                                        log::debug!("Sent 1h aggregated data for {}", namespace_clone);
+                                    }
+
+                                    // 检查是否到达1天聚合点
+                                    if should_aggregate(timestamp_ms, last_1d_ts, INTERVAL_1D) {
+                                        if let Err(e) = db.insert_1d_aggregated(&data) {
+                                            log::error!("Failed to store 1d aggregated data for {}: {}", namespace_clone, e);
+                                        }
+                                        last_1d_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1D));
+                                        log::debug!("Saved 1d aggregated data for {}", namespace_clone);
                                     }
                                 }
                             }
@@ -256,12 +301,20 @@ impl TrafficCollector {
         Ok(())
     }
 
-    /// 订阅特定命名空间的数据（精准订阅）
-    pub async fn subscribe(&self, namespace: &str) -> Option<broadcast::Receiver<TrafficData>> {
-        let senders = self.data_senders.read().await;
-        if let Some(sender) = senders.get(namespace) {
-            log::info!("New subscriber connected for namespace: {}", namespace);
-            Some(sender.subscribe())
+    /// 订阅特定命名空间和分辨率的数据（精准订阅）
+    pub async fn subscribe(
+        &self,
+        namespace: &str,
+        resolution: Resolution,
+    ) -> Option<broadcast::Receiver<TrafficData>> {
+        let channels = self.channels.read().await;
+        if let Some(ch) = channels.get(namespace) {
+            log::info!(
+                "New subscriber connected for namespace: {}, resolution: {:?}",
+                namespace,
+                resolution
+            );
+            Some(ch.subscribe(resolution))
         } else {
             log::warn!("Namespace not found for subscription: {}", namespace);
             None
@@ -310,7 +363,7 @@ async fn collect_namespace_data(namespace: &str) -> Result<TrafficData> {
         timestamp,
         timestamp_ms,
         interfaces,
-        resolution: Some("1s".to_string()),
+        resolution: None,
     };
 
     Ok(data)
