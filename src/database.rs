@@ -794,6 +794,8 @@ mod tests {
                 name: "eth0".to_string(),
                 rx_bytes: 1000,
                 tx_bytes: 500,
+                rx_speed: None,
+                tx_speed: None,
             }],
             ppp0: Ppp0Stats::unavailable(),
             resolution: Some("1s".to_string()),
