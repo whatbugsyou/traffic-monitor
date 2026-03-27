@@ -9,8 +9,6 @@ use crate::collector::TrafficCollector;
 use crate::database::Database;
 use crate::models::*;
 
-
-
 /// HTTP 服务器
 pub struct HttpServerWrapper {
     config: ServerConfig,
@@ -64,10 +62,22 @@ impl HttpServerWrapper {
         })
         .bind(format!("{}:{}", host, port))
         .context("Failed to bind HTTP server")?
-        .workers(2);
+        .workers(2)
+        .run();
 
-        // 使用 actix 内置的优雅关闭
-        server.run().await.context("Failed to run HTTP server")?;
+        // 获取服务器句柄用于优雅关闭
+        let server_handle = server.handle();
+
+        // 在单独的任务中等待 Ctrl+C 信号
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                log::info!("Received Ctrl+C signal, initiating graceful shutdown...");
+                server_handle.stop(true).await;
+            }
+        });
+
+        // 等待服务器关闭
+        server.await.context("Failed to run HTTP server")?;
 
         Ok(())
     }
