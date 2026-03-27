@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -55,18 +55,14 @@ impl Database {
         )
         .context("Failed to create traffic_history table")?;
 
-        // 创建10秒聚合表
+        // 创建10秒聚合表（结构与原始数据表相同）
         conn.execute(
             "CREATE TABLE IF NOT EXISTS traffic_history_10s (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 namespace TEXT NOT NULL DEFAULT 'default',
                 timestamp TEXT NOT NULL,
                 timestamp_ms INTEGER NOT NULL,
-                rx_speed_avg REAL NOT NULL DEFAULT 0,
-                tx_speed_avg REAL NOT NULL DEFAULT 0,
-                rx_dropped_sum INTEGER NOT NULL DEFAULT 0,
-                tx_dropped_sum INTEGER NOT NULL DEFAULT 0,
-                sample_count INTEGER NOT NULL DEFAULT 0,
+                data TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(namespace, timestamp_ms)
             )",
@@ -74,18 +70,14 @@ impl Database {
         )
         .context("Failed to create traffic_history_10s table")?;
 
-        // 创建1分钟聚合表
+        // 创建1分钟聚合表（结构与原始数据表相同）
         conn.execute(
             "CREATE TABLE IF NOT EXISTS traffic_history_1m (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 namespace TEXT NOT NULL DEFAULT 'default',
                 timestamp TEXT NOT NULL,
                 timestamp_ms INTEGER NOT NULL,
-                rx_speed_avg REAL NOT NULL DEFAULT 0,
-                tx_speed_avg REAL NOT NULL DEFAULT 0,
-                rx_dropped_sum INTEGER NOT NULL DEFAULT 0,
-                tx_dropped_sum INTEGER NOT NULL DEFAULT 0,
-                sample_count INTEGER NOT NULL DEFAULT 0,
+                data TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(namespace, timestamp_ms)
             )",
@@ -215,6 +207,40 @@ impl Database {
         Ok(())
     }
 
+    /// 插入10秒聚合数据（原始快照）
+    pub fn insert_10s_aggregated(&self, data: &TrafficData) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        let data_json = serde_json::to_string(data).context("Failed to serialize traffic data")?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO traffic_history_10s
+             (namespace, timestamp, timestamp_ms, data)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![data.namespace, data.timestamp, data.timestamp_ms, data_json],
+        )
+        .context("Failed to insert 10s aggregated data")?;
+
+        Ok(())
+    }
+
+    /// 插入1分钟聚合数据（原始快照）
+    pub fn insert_1m_aggregated(&self, data: &TrafficData) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        let data_json = serde_json::to_string(data).context("Failed to serialize traffic data")?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO traffic_history_1m
+             (namespace, timestamp, timestamp_ms, data)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![data.namespace, data.timestamp, data.timestamp_ms, data_json],
+        )
+        .context("Failed to insert 1m aggregated data")?;
+
+        Ok(())
+    }
+
     /// 获取所有命名空间
     pub fn get_namespaces(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
@@ -262,7 +288,7 @@ impl Database {
         }
     }
 
-    /// 根据时间范围获取历史数据
+    /// 根据时间范围获取历史数据（自动选择合适的表）
     pub fn get_history_by_duration(
         &self,
         namespace: &str,
@@ -283,7 +309,7 @@ impl Database {
         }
     }
 
-    /// 获取原始历史数据
+    /// 获取原始历史数据（查询时计算速度）
     fn get_raw_history(&self, namespace: &str, since_ms: i64) -> Result<Vec<TrafficData>> {
         let conn = self.conn.lock().unwrap();
 
@@ -304,65 +330,11 @@ impl Database {
             .collect::<std::result::Result<Vec<String>, _>>()
             .context("Failed to collect raw history")?;
 
-        let mut result = Vec::new();
-        let mut prev_data: Option<TrafficData> = None;
-
-        for data_json in data_list {
-            let mut data: TrafficData =
-                serde_json::from_str(&data_json).context("Failed to deserialize traffic data")?;
-
-            data.resolution = Some("1s".to_string());
-
-            // 计算速度
-            if let Some(prev) = &prev_data {
-                let interval_ms = data.timestamp_ms - prev.timestamp_ms;
-                if interval_ms > 0 {
-                    for iface in &mut data.interfaces {
-                        if let Some(prev_iface) =
-                            prev.interfaces.iter().find(|i| i.name == iface.name)
-                        {
-                            let rx_speed = iface
-                                .rx_bytes
-                                .saturating_sub(prev_iface.rx_bytes)
-                                .saturating_mul(1000)
-                                / interval_ms as u64;
-                            let tx_speed = iface
-                                .tx_bytes
-                                .saturating_sub(prev_iface.tx_bytes)
-                                .saturating_mul(1000)
-                                / interval_ms as u64;
-
-                            iface.rx_speed = Some(rx_speed);
-                            iface.tx_speed = Some(tx_speed);
-                        }
-                    }
-
-                    // 计算丢包增量
-                    if data.ppp0.available && prev.ppp0.available {
-                        data.ppp0.rx_dropped_inc = Some(
-                            data.ppp0
-                                .rx_dropped
-                                .unwrap_or(0)
-                                .saturating_sub(prev.ppp0.rx_dropped.unwrap_or(0)),
-                        );
-                        data.ppp0.tx_dropped_inc = Some(
-                            data.ppp0
-                                .tx_dropped
-                                .unwrap_or(0)
-                                .saturating_sub(prev.ppp0.tx_dropped.unwrap_or(0)),
-                        );
-                    }
-                }
-            }
-
-            result.push(data.clone());
-            prev_data = Some(data);
-        }
-
-        Ok(result)
+        // 解析并计算速度
+        calculate_speeds_for_data_list(data_list, "1s")
     }
 
-    /// 获取10秒聚合历史数据
+    /// 获取10秒聚合历史数据（查询时计算速度）
     fn get_10s_aggregated_history(
         &self,
         namespace: &str,
@@ -372,38 +344,26 @@ impl Database {
 
         let mut stmt = conn
             .prepare(
-                "SELECT namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,
-                    rx_dropped_sum, tx_dropped_sum, sample_count
-             FROM traffic_history_10s
+                "SELECT data FROM traffic_history_10s
              WHERE namespace = ?1 AND timestamp_ms > ?2
              ORDER BY timestamp_ms ASC",
             )
             .context("Failed to prepare statement")?;
 
-        let aggregated_list = stmt
+        let data_list = stmt
             .query_map(params![namespace, since_ms], |row| {
-                Ok(self.row_to_aggregated_data(row))
+                let data_json: String = row.get(0)?;
+                Ok(data_json)
             })
             .context("Failed to query 10s aggregated history")?
-            .collect::<std::result::Result<Vec<AggregatedData>, _>>()
+            .collect::<std::result::Result<Vec<String>, _>>()
             .context("Failed to collect 10s aggregated history")?;
 
-        Ok(aggregated_list
-            .into_iter()
-            .map(|agg| {
-                TrafficData {
-                    namespace: agg.namespace,
-                    timestamp: agg.timestamp,
-                    timestamp_ms: agg.timestamp_ms,
-                    interfaces: vec![], // 聚合数据不包含接口详情
-                    ppp0: Ppp0Stats::unavailable(),
-                    resolution: Some("10s".to_string()),
-                }
-            })
-            .collect())
+        // 解析并计算速度
+        calculate_speeds_for_data_list(data_list, "10s")
     }
 
-    /// 获取1分钟聚合历史数据
+    /// 获取1分钟聚合历史数据（查询时计算速度）
     fn get_1m_aggregated_history(
         &self,
         namespace: &str,
@@ -413,101 +373,26 @@ impl Database {
 
         let mut stmt = conn
             .prepare(
-                "SELECT namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,
-                    rx_dropped_sum, tx_dropped_sum, sample_count
-             FROM traffic_history_1m
+                "SELECT data FROM traffic_history_1m
              WHERE namespace = ?1 AND timestamp_ms > ?2
              ORDER BY timestamp_ms ASC",
             )
             .context("Failed to prepare statement")?;
 
-        let aggregated_list = stmt
+        let data_list = stmt
             .query_map(params![namespace, since_ms], |row| {
-                Ok(self.row_to_aggregated_data(row))
+                let data_json: String = row.get(0)?;
+                Ok(data_json)
             })
             .context("Failed to query 1m aggregated history")?
-            .collect::<std::result::Result<Vec<AggregatedData>, _>>()
+            .collect::<std::result::Result<Vec<String>, _>>()
             .context("Failed to collect 1m aggregated history")?;
 
-        Ok(aggregated_list
-            .into_iter()
-            .map(|agg| TrafficData {
-                namespace: agg.namespace,
-                timestamp: agg.timestamp,
-                timestamp_ms: agg.timestamp_ms,
-                interfaces: vec![],
-                ppp0: Ppp0Stats::unavailable(),
-                resolution: Some("1m".to_string()),
-            })
-            .collect())
+        // 解析并计算速度
+        calculate_speeds_for_data_list(data_list, "1m")
     }
 
-    /// 将数据库行转换为聚合数据
-    fn row_to_aggregated_data(&self, row: &Row) -> AggregatedData {
-        AggregatedData {
-            namespace: row.get(0).unwrap_or_default(),
-            timestamp: row.get(1).unwrap_or_default(),
-            timestamp_ms: row.get(2).unwrap_or(0),
-            rx_speed_avg: row.get(3).unwrap_or(0.0),
-            tx_speed_avg: row.get(4).unwrap_or(0.0),
-            rx_dropped_sum: row.get(5).unwrap_or(0),
-            tx_dropped_sum: row.get(6).unwrap_or(0),
-            sample_count: row.get(7).unwrap_or(0),
-            resolution: None,
-        }
-    }
-
-    /// 插入10秒聚合数据
-    pub fn insert_10s_aggregated(&self, data: &AggregatedData) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-
-        conn.execute(
-            "INSERT OR REPLACE INTO traffic_history_10s
-             (namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,
-              rx_dropped_sum, tx_dropped_sum, sample_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                data.namespace,
-                data.timestamp,
-                data.timestamp_ms,
-                data.rx_speed_avg,
-                data.tx_speed_avg,
-                data.rx_dropped_sum,
-                data.tx_dropped_sum,
-                data.sample_count
-            ],
-        )
-        .context("Failed to insert 10s aggregated data")?;
-
-        Ok(())
-    }
-
-    /// 插入1分钟聚合数据
-    pub fn insert_1m_aggregated(&self, data: &AggregatedData) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-
-        conn.execute(
-            "INSERT OR REPLACE INTO traffic_history_1m
-             (namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,
-              rx_dropped_sum, tx_dropped_sum, sample_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                data.namespace,
-                data.timestamp,
-                data.timestamp_ms,
-                data.rx_speed_avg,
-                data.tx_speed_avg,
-                data.rx_dropped_sum,
-                data.tx_dropped_sum,
-                data.sample_count
-            ],
-        )
-        .context("Failed to insert 1m aggregated data")?;
-
-        Ok(())
-    }
-
-    /// 获取指定时间范围内的原始数据（用于聚合）
+    /// 获取指定时间范围内的原始数据（用于聚合判断）
     pub fn get_raw_data_for_aggregation(
         &self,
         namespace: &str,
@@ -538,32 +423,6 @@ impl Database {
                 serde_json::from_str(&data_json).context("Failed to deserialize traffic data")
             })
             .collect()
-    }
-
-    /// 获取指定时间范围内的10秒聚合数据（用于生成1分钟聚合）
-    pub fn get_10s_data_for_aggregation(
-        &self,
-        namespace: &str,
-        since_ms: i64,
-    ) -> Result<Vec<AggregatedData>> {
-        let conn = self.conn.lock().unwrap();
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT namespace, timestamp, timestamp_ms, rx_speed_avg, tx_speed_avg,
-                    rx_dropped_sum, tx_dropped_sum, sample_count
-             FROM traffic_history_10s
-             WHERE namespace = ?1 AND timestamp_ms > ?2
-             ORDER BY timestamp_ms ASC",
-            )
-            .context("Failed to prepare statement")?;
-
-        stmt.query_map(params![namespace, since_ms], |row| {
-            Ok(self.row_to_aggregated_data(row))
-        })
-        .context("Failed to query 10s data for aggregation")?
-        .collect::<std::result::Result<Vec<AggregatedData>, _>>()
-        .context("Failed to collect 10s data for aggregation")
     }
 
     /// 清理旧数据
@@ -633,6 +492,68 @@ impl Database {
     }
 }
 
+/// 解析数据列表并计算速度（查询时计算）
+fn calculate_speeds_for_data_list(
+    data_json_list: Vec<String>,
+    resolution: &str,
+) -> Result<Vec<TrafficData>> {
+    let mut result = Vec::new();
+    let mut prev_data: Option<TrafficData> = None;
+
+    for data_json in data_json_list {
+        let mut data: TrafficData =
+            serde_json::from_str(&data_json).context("Failed to deserialize traffic data")?;
+
+        data.resolution = Some(resolution.to_string());
+
+        // 计算速度
+        if let Some(prev) = &prev_data {
+            let interval_ms = data.timestamp_ms - prev.timestamp_ms;
+            if interval_ms > 0 {
+                for iface in &mut data.interfaces {
+                    if let Some(prev_iface) = prev.interfaces.iter().find(|i| i.name == iface.name)
+                    {
+                        let rx_speed = iface
+                            .rx_bytes
+                            .saturating_sub(prev_iface.rx_bytes)
+                            .saturating_mul(1000)
+                            / interval_ms as u64;
+                        let tx_speed = iface
+                            .tx_bytes
+                            .saturating_sub(prev_iface.tx_bytes)
+                            .saturating_mul(1000)
+                            / interval_ms as u64;
+
+                        iface.rx_speed = Some(rx_speed);
+                        iface.tx_speed = Some(tx_speed);
+                    }
+                }
+
+                // 计算丢包增量
+                if data.ppp0.available && prev.ppp0.available {
+                    data.ppp0.rx_dropped_inc = Some(
+                        data.ppp0
+                            .rx_dropped
+                            .unwrap_or(0)
+                            .saturating_sub(prev.ppp0.rx_dropped.unwrap_or(0)),
+                    );
+                    data.ppp0.tx_dropped_inc = Some(
+                        data.ppp0
+                            .tx_dropped
+                            .unwrap_or(0)
+                            .saturating_sub(prev.ppp0.tx_dropped.unwrap_or(0)),
+                    );
+                }
+            }
+        }
+
+        result.push(data.clone());
+        prev_data = Some(data);
+    }
+
+    Ok(result)
+}
+
 /// 数据库统计信息
 #[derive(Debug, Clone)]
 pub struct DatabaseStats {
@@ -640,4 +561,43 @@ pub struct DatabaseStats {
     pub aggregated_10s_count: i64,
     pub aggregated_1m_count: i64,
     pub namespace_count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_database_creation() {
+        let config = DatabaseConfig::default();
+        let db = Database::new(config);
+        assert!(db.is_ok());
+    }
+
+    #[test]
+    fn test_insert_and_query() {
+        let config = DatabaseConfig {
+            db_path: "data/test.db".to_string(),
+            ..Default::default()
+        };
+        let db = Database::new(config).unwrap();
+
+        let data = TrafficData {
+            namespace: "test".to_string(),
+            timestamp: "2024-01-01 00:00:00".to_string(),
+            timestamp_ms: 1704067200000,
+            interfaces: vec![InterfaceStats {
+                name: "eth0".to_string(),
+                rx_bytes: 1000,
+                tx_bytes: 500,
+            }],
+            ppp0: Ppp0Stats::unavailable(),
+            resolution: Some("1s".to_string()),
+        };
+
+        db.insert_traffic_data(&data).unwrap();
+
+        let result = db.get_current_data("test").unwrap();
+        assert!(result.is_some());
+    }
 }
