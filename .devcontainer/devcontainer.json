@@ -1,0 +1,30 @@
+{
+  "name": "Traffic Monitor Dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "containerEnv": {
+    "HTTP_PROXY": "http://host.docker.internal:7890",
+    "HTTPS_PROXY": "http://host.docker.internal:7890",
+    "http_proxy": "http://host.docker.internal:7890",
+    "https_proxy": "http://host.docker.internal:7890",
+    "NO_PROXY": "localhost,127.0.0.1",
+    "no_proxy": "localhost,127.0.0.1"
+  },
+  "postCreateCommand": "cargo build",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates"
+      ]
+    }
+  },
+  "forwardPorts": [
+    8080
+  ],
+  "runArgs": [
+    "--privileged"
+  ]
+}
