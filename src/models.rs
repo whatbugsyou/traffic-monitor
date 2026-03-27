@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// 网络接口统计信息
@@ -7,8 +6,10 @@ pub struct InterfaceStats {
     pub name: String,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// 接收速度 (bytes/s)，查询时计算
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rx_speed: Option<u64>,
+    /// 发送速度 (bytes/s)，查询时计算
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_speed: Option<u64>,
 }
@@ -37,8 +38,10 @@ pub struct Ppp0Stats {
     pub tx_overruns: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_carrier: Option<u64>,
+    /// 接收丢包增量，查询时计算
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rx_dropped_inc: Option<u64>,
+    /// 发送丢包增量，查询时计算
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_dropped_inc: Option<u64>,
 }
@@ -63,7 +66,7 @@ impl Ppp0Stats {
     }
 }
 
-/// 流量数据
+/// 流量数据（原始快照）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficData {
     pub namespace: String,
@@ -71,21 +74,7 @@ pub struct TrafficData {
     pub timestamp_ms: i64,
     pub interfaces: Vec<InterfaceStats>,
     pub ppp0: Ppp0Stats,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resolution: Option<String>,
-}
-
-/// 聚合数据（10秒/1分钟）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AggregatedData {
-    pub namespace: String,
-    pub timestamp: String,
-    pub timestamp_ms: i64,
-    pub rx_speed_avg: f64,
-    pub tx_speed_avg: f64,
-    pub rx_dropped_sum: u64,
-    pub tx_dropped_sum: u64,
-    pub sample_count: u32,
+    /// 数据分辨率：1s, 10s, 1m
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
 }
@@ -97,15 +86,6 @@ pub struct HistoryResponse {
     pub duration_minutes: u32,
     pub count: usize,
     pub data: Vec<TrafficData>,
-}
-
-/// 聚合历史数据响应
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AggregatedHistoryResponse {
-    pub namespace: String,
-    pub duration_minutes: u32,
-    pub count: usize,
-    pub data: Vec<AggregatedData>,
 }
 
 /// 命名空间列表响应
@@ -126,9 +106,9 @@ pub struct SseMessage {
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
     pub db_path: String,
-    pub retention_raw_minutes: u32, // 原始数据保留时间（5分钟）
-    pub retention_10s_hours: u32,   // 10秒聚合数据保留时间（1小时）
-    pub retention_1m_hours: u32,    // 1分钟聚合数据保留时间（3小时）
+    pub retention_raw_minutes: u32,
+    pub retention_10s_hours: u32,
+    pub retention_1m_hours: u32,
 }
 
 impl Default for DatabaseConfig {
@@ -168,7 +148,6 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub web_root: String,
-    pub aggregation_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -177,7 +156,6 @@ impl Default for ServerConfig {
             host: "0.0.0.0".to_string(),
             port: 8080,
             web_root: "web".to_string(),
-            aggregation_interval_secs: 10,
         }
     }
 }
