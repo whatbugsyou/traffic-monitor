@@ -85,6 +85,36 @@ impl Database {
         )
         .context("Failed to create traffic_history_1m table")?;
 
+        // 创建1小时聚合表（结构与原始数据表相同）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS traffic_history_1h (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace TEXT NOT NULL DEFAULT 'default',
+                timestamp TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(namespace, timestamp_ms)
+            )",
+            [],
+        )
+        .context("Failed to create traffic_history_1h table")?;
+
+        // 创建1天聚合表（结构与原始数据表相同）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS traffic_history_1d (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace TEXT NOT NULL DEFAULT 'default',
+                timestamp TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(namespace, timestamp_ms)
+            )",
+            [],
+        )
+        .context("Failed to create traffic_history_1d table")?;
+
         // 创建索引
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_history_namespace_ts
@@ -106,6 +136,20 @@ impl Database {
             [],
         )
         .context("Failed to create index on traffic_history_1m")?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_1h_namespace_ts
+             ON traffic_history_1h(namespace, timestamp_ms)",
+            [],
+        )
+        .context("Failed to create index on traffic_history_1h")?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_1d_namespace_ts
+             ON traffic_history_1d(namespace, timestamp_ms)",
+            [],
+        )
+        .context("Failed to create index on traffic_history_1d")?;
 
         // 创建触发器自动清理旧数据
         self.create_cleanup_triggers(&conn)?;
@@ -162,6 +206,38 @@ impl Database {
             [],
         )
         .context("Failed to create cleanup trigger for traffic_history_1m")?;
+
+        // 1小时聚合数据保留7天
+        let retention_1h_ms = self.config.retention_1h_days as i64 * 24 * 60 * 60 * 1000;
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER IF NOT EXISTS cleanup_1h_data
+                 AFTER INSERT ON traffic_history_1h
+                 BEGIN
+                     DELETE FROM traffic_history_1h
+                     WHERE timestamp_ms < (NEW.timestamp_ms - {});
+                 END",
+                retention_1h_ms
+            ),
+            [],
+        )
+        .context("Failed to create cleanup trigger for traffic_history_1h")?;
+
+        // 1天聚合数据保留30天
+        let retention_1d_ms = self.config.retention_1d_days as i64 * 24 * 60 * 60 * 1000;
+        conn.execute(
+            &format!(
+                "CREATE TRIGGER IF NOT EXISTS cleanup_1d_data
+                 AFTER INSERT ON traffic_history_1d
+                 BEGIN
+                     DELETE FROM traffic_history_1d
+                     WHERE timestamp_ms < (NEW.timestamp_ms - {});
+                 END",
+                retention_1d_ms
+            ),
+            [],
+        )
+        .context("Failed to create cleanup trigger for traffic_history_1d")?;
 
         Ok(())
     }
@@ -237,6 +313,40 @@ impl Database {
             params![data.namespace, data.timestamp, data.timestamp_ms, data_json],
         )
         .context("Failed to insert 1m aggregated data")?;
+
+        Ok(())
+    }
+
+    /// 插入1小时聚合数据（原始快照）
+    pub fn insert_1h_aggregated(&self, data: &TrafficData) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        let data_json = serde_json::to_string(data).context("Failed to serialize traffic data")?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO traffic_history_1h
+             (namespace, timestamp, timestamp_ms, data)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![data.namespace, data.timestamp, data.timestamp_ms, data_json],
+        )
+        .context("Failed to insert 1h aggregated data")?;
+
+        Ok(())
+    }
+
+    /// 插入1天聚合数据（原始快照）
+    pub fn insert_1d_aggregated(&self, data: &TrafficData) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+
+        let data_json = serde_json::to_string(data).context("Failed to serialize traffic data")?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO traffic_history_1d
+             (namespace, timestamp, timestamp_ms, data)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![data.namespace, data.timestamp, data.timestamp_ms, data_json],
+        )
+        .context("Failed to insert 1d aggregated data")?;
 
         Ok(())
     }
@@ -452,7 +562,21 @@ impl Database {
             )
             .context("Failed to cleanup traffic_history_1m")?;
 
-        Ok(deleted_raw + deleted_10s + deleted_1m)
+        let deleted_1h = conn
+            .execute(
+                "DELETE FROM traffic_history_1h WHERE timestamp_ms < ?1",
+                params![cutoff_ms],
+            )
+            .context("Failed to cleanup traffic_history_1h")?;
+
+        let deleted_1d = conn
+            .execute(
+                "DELETE FROM traffic_history_1d WHERE timestamp_ms < ?1",
+                params![cutoff_ms],
+            )
+            .context("Failed to cleanup traffic_history_1d")?;
+
+        Ok(deleted_raw + deleted_10s + deleted_1m + deleted_1h + deleted_1d)
     }
 
     /// 获取数据库统计信息
@@ -475,6 +599,18 @@ impl Database {
             })
             .unwrap_or(0);
 
+        let aggregated_1h_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM traffic_history_1h", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+
+        let aggregated_1d_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM traffic_history_1d", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+
         let namespace_count: i64 = conn
             .query_row(
                 "SELECT COUNT(DISTINCT namespace) FROM traffic_history",
@@ -487,6 +623,8 @@ impl Database {
             raw_count,
             aggregated_10s_count,
             aggregated_1m_count,
+            aggregated_1h_count,
+            aggregated_1d_count,
             namespace_count,
         })
     }
@@ -560,6 +698,8 @@ pub struct DatabaseStats {
     pub raw_count: i64,
     pub aggregated_10s_count: i64,
     pub aggregated_1m_count: i64,
+    pub aggregated_1h_count: i64,
+    pub aggregated_1d_count: i64,
     pub namespace_count: i64,
 }
 

@@ -12,6 +12,8 @@ use crate::models::*;
 
 const INTERVAL_10S: i64 = 10_000; // 10秒（毫秒）
 const INTERVAL_1M: i64 = 60_000; // 1分钟（毫秒）
+const INTERVAL_1H: i64 = 3_600_000; // 1小时（毫秒）
+const INTERVAL_1D: i64 = 86_400_000; // 1天（毫秒）
 
 /// 流量数据采集器
 pub struct TrafficCollector {
@@ -142,6 +144,8 @@ impl TrafficCollector {
             let mut collect_interval = interval(Duration::from_secs(config.interval_secs));
             let mut last_10s_ts: Option<i64> = None;
             let mut last_1m_ts: Option<i64> = None;
+            let mut last_1h_ts: Option<i64> = None;
+            let mut last_1d_ts: Option<i64> = None;
 
             log::info!("Started collector for namespace: {}", namespace);
 
@@ -173,6 +177,24 @@ impl TrafficCollector {
                                     }
                                     last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
                                     log::debug!("Saved 1m aggregated data for {} at {}", namespace, data.timestamp);
+                                }
+
+                                // 检查是否到达1小时聚合点
+                                if should_aggregate(timestamp_ms, last_1h_ts, INTERVAL_1H) {
+                                    if let Err(e) = db.insert_1h_aggregated(&data) {
+                                        log::error!("Failed to store 1h aggregated data for {}: {}", namespace, e);
+                                    }
+                                    last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
+                                    log::debug!("Saved 1h aggregated data for {} at {}", namespace, data.timestamp);
+                                }
+
+                                // 检查是否到达1天聚合点
+                                if should_aggregate(timestamp_ms, last_1d_ts, INTERVAL_1D) {
+                                    if let Err(e) = db.insert_1d_aggregated(&data) {
+                                        log::error!("Failed to store 1d aggregated data for {}: {}", namespace, e);
+                                    }
+                                    last_1d_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1D));
+                                    log::debug!("Saved 1d aggregated data for {} at {}", namespace, data.timestamp);
                                 }
 
                                 // 广播数据

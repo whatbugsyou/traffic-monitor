@@ -109,6 +109,8 @@ pub struct DatabaseConfig {
     pub retention_raw_minutes: u32,
     pub retention_10s_hours: u32,
     pub retention_1m_hours: u32,
+    pub retention_1h_days: u32,
+    pub retention_1d_days: u32,
 }
 
 impl Default for DatabaseConfig {
@@ -118,6 +120,8 @@ impl Default for DatabaseConfig {
             retention_raw_minutes: 5,
             retention_10s_hours: 1,
             retention_1m_hours: 3,
+            retention_1h_days: 7,
+            retention_1d_days: 30,
         }
     }
 }

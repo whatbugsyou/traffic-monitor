@@ -26,6 +26,8 @@ async fn main() -> Result<()> {
         retention_raw_minutes: 5,
         retention_10s_hours: 1,
         retention_1m_hours: 3,
+        retention_1h_days: 7,
+        retention_1d_days: 30,
     };
 
     let collector_config = CollectorConfig {
