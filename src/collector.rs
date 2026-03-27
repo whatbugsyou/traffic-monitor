@@ -197,10 +197,8 @@ impl TrafficCollector {
                                     log::debug!("Saved 1d aggregated data for {} at {}", namespace, data.timestamp);
                                 }
 
-                                // 广播数据
-                                if let Err(e) = data_sender.send(data) {
-                                    log::error!("Failed to broadcast data for {}: {}", namespace, e);
-                                }
+                                // 广播数据（如果没有订阅者则跳过，数据已存储到数据库）
+                                let _ = data_sender.send(data);
                             }
                             Err(e) => {
                                 log::error!("Failed to collect data for {}: {}", namespace, e);
