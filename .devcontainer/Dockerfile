@@ -1,5 +1,9 @@
 FROM rust:1.82
 
+# 设置时区
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 # 安装基础工具
 RUN apt-get update && apt-get install -y \
     gcc \
