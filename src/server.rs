@@ -43,11 +43,7 @@ impl HttpServerWrapper {
         log::info!("  GET /api/stream?namespace=<ns>&duration=<min>&resolution=<res> - SSE real-time stream");
 
         let server = HttpServer::new(move || {
-            let cors = Cors::default()
-                .allow_any_origin()
-                .allow_any_method()
-                .allow_any_header()
-                .max_age(3600);
+            let cors = Cors::permissive();
 
             App::new()
                 .wrap(cors)
