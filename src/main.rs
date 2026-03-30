@@ -21,22 +21,10 @@ async fn main() -> Result<()> {
     log::info!("========================================");
 
     // 加载配置
-    let db_config = DatabaseConfig {
-        db_path: "data/traffic_monitor.db".to_string(),
-        retention_raw_minutes: 5,
-        retention_10s_hours: 1,
-        retention_1m_hours: 3,
-        retention_1h_days: 7,
-        retention_1d_days: 30,
-    };
+    let db_config = DatabaseConfig::default();
+    let collector_config = CollectorConfig::default();
 
-    let collector_config = CollectorConfig { interval_secs: 1 };
-
-    let server_config = ServerConfig {
-        host: "0.0.0.0".to_string(),
-        port: 18080,
-        web_root: "web".to_string(),
-    };
+    let server_config = ServerConfig::default();
 
     log::info!("Configuration loaded:");
     log::info!("  Database: {}", db_config.db_path);
