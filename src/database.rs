@@ -568,8 +568,12 @@ mod tests {
                 name: "eth0".to_string(),
                 rx_bytes: 1000,
                 tx_bytes: 500,
+                rx_dropped: 0,
+                tx_dropped: 0,
                 rx_speed: None,
                 tx_speed: None,
+                rx_dropped_speed: None,
+                tx_dropped_speed: None,
             }],
 
             resolution: Some("1s".to_string()),

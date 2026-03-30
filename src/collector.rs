@@ -6,7 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{Semaphore, broadcast, RwLock};
+use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::database::Database;
@@ -379,88 +380,48 @@ struct NamespaceAggregationState {
 }
 
 async fn collect_namespace_round(namespaces: &[String]) -> Vec<(String, Result<TrafficData>)> {
-    match namespaces {
-        [] => Vec::new(),
-        [ns1] => {
-            let (r1,) = tokio::join!(collect_namespace_data(ns1));
-            vec![(ns1.clone(), r1)]
-        }
-        [ns1, ns2] => {
-            let (r1, r2) = tokio::join!(
-                collect_namespace_data(ns1),
-                collect_namespace_data(ns2)
-            );
-            vec![(ns1.clone(), r1), (ns2.clone(), r2)]
-        }
-        [ns1, ns2, ns3] => {
-            let (r1, r2, r3) = tokio::join!(
-                collect_namespace_data(ns1),
-                collect_namespace_data(ns2),
-                collect_namespace_data(ns3)
-            );
-            vec![(ns1.clone(), r1), (ns2.clone(), r2), (ns3.clone(), r3)]
-        }
-        [ns1, ns2, ns3, ns4] => {
-            let (r1, r2, r3, r4) = tokio::join!(
-                collect_namespace_data(ns1),
-                collect_namespace_data(ns2),
-                collect_namespace_data(ns3),
-                collect_namespace_data(ns4)
-            );
-            vec![
-                (ns1.clone(), r1),
-                (ns2.clone(), r2),
-                (ns3.clone(), r3),
-                (ns4.clone(), r4),
-            ]
-        }
-        _ => {
-            let mut results = Vec::with_capacity(namespaces.len());
+    if namespaces.is_empty() {
+        return Vec::new();
+    }
 
-            for chunk in namespaces.chunks(4) {
-                match chunk {
-                    [ns1, ns2, ns3, ns4] => {
-                        let (r1, r2, r3, r4) = tokio::join!(
-                            collect_namespace_data(ns1),
-                            collect_namespace_data(ns2),
-                            collect_namespace_data(ns3),
-                            collect_namespace_data(ns4)
-                        );
-                        results.push((ns1.clone(), r1));
-                        results.push((ns2.clone(), r2));
-                        results.push((ns3.clone(), r3));
-                        results.push((ns4.clone(), r4));
-                    }
-                    [ns1, ns2, ns3] => {
-                        let (r1, r2, r3) = tokio::join!(
-                            collect_namespace_data(ns1),
-                            collect_namespace_data(ns2),
-                            collect_namespace_data(ns3)
-                        );
-                        results.push((ns1.clone(), r1));
-                        results.push((ns2.clone(), r2));
-                        results.push((ns3.clone(), r3));
-                    }
-                    [ns1, ns2] => {
-                        let (r1, r2) = tokio::join!(
-                            collect_namespace_data(ns1),
-                            collect_namespace_data(ns2)
-                        );
-                        results.push((ns1.clone(), r1));
-                        results.push((ns2.clone(), r2));
-                    }
-                    [ns1] => {
-                        let (r1,) = tokio::join!(collect_namespace_data(ns1));
-                        results.push((ns1.clone(), r1));
-                    }
-                    [] => {}
-                    _ => unreachable!(),
-                }
+    let max_concurrency = namespaces.len().min(8).max(1);
+    let semaphore = Arc::new(Semaphore::new(max_concurrency));
+    let mut join_set = JoinSet::new();
+
+    for namespace in namespaces.iter().cloned() {
+        let semaphore = Arc::clone(&semaphore);
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .context("Failed to acquire namespace collection permit")?;
+            let result = collect_namespace_data(&namespace).await;
+            Ok::<_, anyhow::Error>((namespace, result))
+        });
+    }
+
+    let mut results = Vec::with_capacity(namespaces.len());
+
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok((namespace, result))) => results.push((namespace, result)),
+            Ok(Err(err)) => {
+                results.push((
+                    "unknown".to_string(),
+                    Err(err.context("Namespace collection task failed before execution")),
+                ));
             }
-
-            results
+            Err(err) => {
+                results.push((
+                    "unknown".to_string(),
+                    Err(anyhow::anyhow!("Namespace collection task join failed: {}", err)),
+                ));
+            }
         }
     }
+
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    results
 }
 
 /// 判断是否应该进行聚合
@@ -499,38 +460,28 @@ async fn collect_namespace_data(namespace: &str) -> Result<TrafficData> {
 
 /// 采集网络接口数据
 async fn collect_interfaces(namespace: &str) -> Result<Vec<InterfaceStats>> {
-    collect_interfaces_via_setns(namespace).await
+    collect_interfaces_via_setns(namespace)
 }
 
-
-
-/// 采集网络接口数据（默认命名空间和其他命名空间统一走 setns 流程）
-async fn collect_interfaces_via_setns(namespace: &str) -> Result<Vec<InterfaceStats>> {
-    use std::fs;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-    use tokio::io::AsyncReadExt;
+fn collect_interfaces_via_setns(namespace: &str) -> Result<Vec<InterfaceStats>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
 
     let namespace = namespace.to_string();
 
-    // ===== 第一步：同步操作（在当前线程中完成）=====
-    log::debug!("Starting sync phase for namespace: {}", namespace);
+    log::debug!("Starting namespace collection for {}", namespace);
 
-    // 1. 打开原命名空间 fd（用于恢复）
     let original_ns = fs::File::open("/proc/self/ns/net")
         .context("Failed to open current namespace")?;
     let original_ns_fd = original_ns.as_raw_fd();
-    log::debug!("Opened original namespace fd: {}", original_ns_fd);
 
-    // 2. 如果不是 default，则打开并切换到目标命名空间
     let target_ns = if namespace == "default" {
         None
     } else {
         let target_path = format!("/var/run/netns/{}", namespace);
         let target_ns = fs::File::open(&target_path)
             .with_context(|| format!("Failed to open namespace: {}", target_path))?;
-        log::debug!("Opened target namespace: {}", target_path);
 
-        log::debug!("Switching to namespace: {}", namespace);
         unsafe {
             let ret = libc::setns(target_ns.as_raw_fd(), libc::CLONE_NEWNET);
             if ret != 0 {
@@ -541,74 +492,65 @@ async fn collect_interfaces_via_setns(namespace: &str) -> Result<Vec<InterfaceSt
                 ));
             }
         }
-        log::debug!("Successfully switched to namespace: {}", namespace);
+
         Some(target_ns)
     };
 
-    // 3. 在当前命名空间视图中收集所有需要读取的文件 fd
-    let mut file_fds: Vec<(String, OwnedFd, OwnedFd, OwnedFd, OwnedFd)> = Vec::new(); // (name, rx_bytes_fd, tx_bytes_fd, rx_dropped_fd, tx_dropped_fd)
+    let result = (|| -> Result<Vec<InterfaceStats>> {
+        let mut net_dev_content = String::new();
+        fs::File::open("/proc/net/dev")
+            .context("Failed to open /proc/net/dev")?
+            .read_to_string(&mut net_dev_content)
+            .context("Failed to read /proc/net/dev")?;
 
-    let net_dir = Path::new("/sys/class/net");
-    if net_dir.exists() {
-        for entry in fs::read_dir(net_dir).context("Failed to read /sys/class/net")? {
-            let entry = entry?;
-            let dev_path = entry.path();
+        let mut interfaces = Vec::new();
 
-            if !dev_path.is_dir() {
+        for line in net_dev_content.lines().skip(2) {
+            let Some((dev_name_raw, stats_raw)) = line.split_once(':') else {
                 continue;
-            }
+            };
 
-            let dev_name = entry.file_name().to_string_lossy().to_string();
+            let dev_name = dev_name_raw.trim().to_string();
 
-            // 排除 lo、VLAN 子接口、veth 别名
             if dev_name == "lo" || dev_name.contains('.') || dev_name.contains('@') {
                 continue;
             }
 
-            let stats_path = dev_path.join("statistics");
-            if !stats_path.exists() {
+            let fields: Vec<&str> = stats_raw.split_whitespace().collect();
+            if fields.len() < 16 {
                 continue;
             }
 
-            // 打开所有需要的文件，并持有 fd 所有权，避免离开作用域后被提前关闭
-            let rx_bytes_fd: OwnedFd = match fs::File::open(stats_path.join("rx_bytes")) {
-                Ok(f) => f.into(),
-                Err(_) => continue,
-            };
-            let tx_bytes_fd: OwnedFd = match fs::File::open(stats_path.join("tx_bytes")) {
-                Ok(f) => f.into(),
-                Err(_) => continue,
-            };
-            let rx_dropped_fd: OwnedFd = match fs::File::open(stats_path.join("rx_dropped")) {
-                Ok(f) => f.into(),
-                Err(_) => continue,
-            };
-            let tx_dropped_fd: OwnedFd = match fs::File::open(stats_path.join("tx_dropped")) {
-                Ok(f) => f.into(),
-                Err(_) => continue,
-            };
+            let rx_bytes = fields[0]
+                .parse::<u64>()
+                .with_context(|| format!("Failed to parse rx_bytes for interface {}", dev_name))?;
+            let rx_dropped = fields[3]
+                .parse::<u64>()
+                .with_context(|| format!("Failed to parse rx_dropped for interface {}", dev_name))?;
+            let tx_bytes = fields[8]
+                .parse::<u64>()
+                .with_context(|| format!("Failed to parse tx_bytes for interface {}", dev_name))?;
+            let tx_dropped = fields[11]
+                .parse::<u64>()
+                .with_context(|| format!("Failed to parse tx_dropped for interface {}", dev_name))?;
 
-            log::debug!(
-                "Opened interface stats fds for {} in namespace {}: rx_bytes={}, tx_bytes={}, rx_dropped={}, tx_dropped={}",
-                dev_name,
-                namespace,
-                rx_bytes_fd.as_raw_fd(),
-                tx_bytes_fd.as_raw_fd(),
-                rx_dropped_fd.as_raw_fd(),
-                tx_dropped_fd.as_raw_fd()
-            );
-
-            file_fds.push((dev_name, rx_bytes_fd, tx_bytes_fd, rx_dropped_fd, tx_dropped_fd));
+            interfaces.push(InterfaceStats {
+                name: dev_name,
+                rx_bytes,
+                tx_bytes,
+                rx_dropped,
+                tx_dropped,
+                rx_speed: None,
+                tx_speed: None,
+                rx_dropped_speed: None,
+                tx_dropped_speed: None,
+            });
         }
-    }
 
-    // 4. 如果发生过切换，则切换回原命名空间
+        Ok(interfaces)
+    })();
+
     if target_ns.is_some() {
-        log::debug!(
-            "Switching back to original namespace, collected {} interfaces from {}",
-            file_fds.len(),
-            namespace
-        );
         unsafe {
             let ret = libc::setns(original_ns_fd, libc::CLONE_NEWNET);
             if ret != 0 {
@@ -619,82 +561,9 @@ async fn collect_interfaces_via_setns(namespace: &str) -> Result<Vec<InterfaceSt
                 ));
             }
         }
-        log::debug!("Switched back to original namespace");
     }
 
-    // ===== 第二步：异步并发读取（可以在任意线程执行）=====
-    log::debug!(
-        "Starting async read phase for {} interfaces in namespace: {}",
-        file_fds.len(),
-        namespace
-    );
-
-    let mut interfaces = Vec::new();
-
-    for (dev_name, rx_bytes_fd, tx_bytes_fd, rx_dropped_fd, tx_dropped_fd) in file_fds {
-        let mut rx_bytes_file = unsafe { tokio::fs::File::from_raw_fd(rx_bytes_fd.into_raw_fd()) };
-        let mut tx_bytes_file = unsafe { tokio::fs::File::from_raw_fd(tx_bytes_fd.into_raw_fd()) };
-        let mut rx_dropped_file = unsafe { tokio::fs::File::from_raw_fd(rx_dropped_fd.into_raw_fd()) };
-        let mut tx_dropped_file = unsafe { tokio::fs::File::from_raw_fd(tx_dropped_fd.into_raw_fd()) };
-
-        log::debug!("Concurrently reading 4 files for interface: {}", dev_name);
-        let (rx_bytes_res, tx_bytes_res, rx_dropped_res, tx_dropped_res) = tokio::join!(
-            async {
-                let mut s = String::new();
-                rx_bytes_file.read_to_string(&mut s).await?;
-                Ok::<_, std::io::Error>(s.trim().parse::<u64>())
-            },
-            async {
-                let mut s = String::new();
-                tx_bytes_file.read_to_string(&mut s).await?;
-                Ok::<_, std::io::Error>(s.trim().parse::<u64>())
-            },
-            async {
-                let mut s = String::new();
-                rx_dropped_file.read_to_string(&mut s).await?;
-                Ok::<_, std::io::Error>(s.trim().parse::<u64>())
-            },
-            async {
-                let mut s = String::new();
-                tx_dropped_file.read_to_string(&mut s).await?;
-                Ok::<_, std::io::Error>(s.trim().parse::<u64>())
-            }
-        );
-
-        let rx_bytes = rx_bytes_res
-            .context("Failed to read rx_bytes file")?
-            .context("Failed to parse rx_bytes value")?;
-        let tx_bytes = tx_bytes_res
-            .context("Failed to read tx_bytes file")?
-            .context("Failed to parse tx_bytes value")?;
-        let rx_dropped = rx_dropped_res
-            .context("Failed to read rx_dropped file")?
-            .context("Failed to parse rx_dropped value")?;
-        let tx_dropped = tx_dropped_res
-            .context("Failed to read tx_dropped file")?
-            .context("Failed to parse tx_dropped value")?;
-
-        log::debug!(
-            "Successfully collected stats for interface: {} in namespace {} (rx={}, tx={})",
-            dev_name,
-            namespace,
-            rx_bytes,
-            tx_bytes
-        );
-
-        interfaces.push(InterfaceStats {
-            name: dev_name,
-            rx_bytes,
-            tx_bytes,
-            rx_dropped,
-            tx_dropped,
-            rx_speed: None,
-            tx_speed: None,
-            rx_dropped_speed: None,
-            tx_dropped_speed: None,
-        });
-    }
-
+    let interfaces = result?;
     log::debug!(
         "Completed collection for namespace: {}, total {} interfaces",
         namespace,

@@ -249,13 +249,20 @@ mod tests {
     use super::*;
     use actix_web::test;
 
+    use crate::collector::TrafficCollector;
+
     #[actix_rt::test]
     async fn test_get_namespaces() {
         let config = DatabaseConfig::default();
         let db = Arc::new(Database::new(config).unwrap());
 
+        let collector = Arc::new(
+            TrafficCollector::new(Arc::clone(&db), CollectorConfig::default()).unwrap(),
+        );
+
         let app = App::new()
             .app_data(web::Data::new(db))
+            .app_data(web::Data::new(collector))
             .route("/api/namespaces", web::get().to(get_namespaces));
 
         let mut app = test::init_service(app).await;
