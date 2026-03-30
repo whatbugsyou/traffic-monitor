@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{interval, MissedTickBehavior};
@@ -16,9 +16,6 @@ const INTERVAL_10S: i64 = 10_000; // 10秒（毫秒）
 const INTERVAL_1M: i64 = 60_000; // 1分钟（毫秒）
 const INTERVAL_1H: i64 = 3_600_000; // 1小时（毫秒）
 const INTERVAL_1D: i64 = 86_400_000; // 1天（毫秒）
-
-static COLLECTOR_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-static COLLECTION_ROUND_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 每个命名空间的多粒度广播通道
 struct ResolutionChannels {
@@ -212,33 +209,23 @@ impl TrafficCollector {
         let config = self.config.clone();
 
         tokio::spawn(async move {
-            let scheduler_instance_id = COLLECTOR_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
             let mut collect_interval = interval(Duration::from_secs(config.interval_secs));
             collect_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-            log::info!(
-                "Started collection scheduler, collector_instance_id: {}",
-                scheduler_instance_id
-            );
+            log::info!("Started collection scheduler");
 
             loop {
                 tokio::select! {
                     _ = collect_interval.tick() => {
                         if collection_in_progress.swap(true, Ordering::AcqRel) {
-                            log::warn!(
-                                "Skipping collection tick because previous round is still running, collector_instance_id: {}",
-                                scheduler_instance_id
-                            );
+                            log::warn!("Skipping collection tick because previous round is still running");
                             continue;
                         }
 
-                        let round_id = COLLECTION_ROUND_ID.fetch_add(1, Ordering::Relaxed);
                         let namespaces_snapshot = namespaces.read().await.clone();
 
-                        log::info!(
-                            "Starting collection round: {}, collector_instance_id: {}, namespace_count: {}",
-                            round_id,
-                            scheduler_instance_id,
+                        log::debug!(
+                            "Starting collection round for {} namespaces",
                             namespaces_snapshot.len()
                         );
 
@@ -248,22 +235,9 @@ impl TrafficCollector {
                             match result {
                                 Ok(mut data) => {
                                     let timestamp_ms = data.timestamp_ms;
-                                    log::info!(
-                                        "Collector sample ready for namespace: {}, collector_instance_id: {}, round_id: {}, timestamp_ms: {}",
-                                        namespace,
-                                        scheduler_instance_id,
-                                        round_id,
-                                        timestamp_ms
-                                    );
 
                                     if let Err(e) = db.insert_traffic_data(&data) {
-                                        log::error!(
-                                            "Failed to store data for {} (collector_instance_id: {}, round_id: {}): {}",
-                                            namespace,
-                                            scheduler_instance_id,
-                                            round_id,
-                                            e
-                                        );
+                                        log::error!("Failed to store data for {}: {}", namespace, e);
                                     }
 
                                     let mut state_guard = aggregation_state.write().await;
@@ -274,22 +248,13 @@ impl TrafficCollector {
                                     let ch = channels.read().await;
                                     if let Some(namespace_channels) = ch.get(&namespace) {
                                         data.resolution = Some("1s".to_string());
-                                        log::info!(
-                                            "Sending realtime data for namespace: {}, collector_instance_id: {}, round_id: {}, timestamp_ms: {}",
-                                            namespace,
-                                            scheduler_instance_id,
-                                            round_id,
-                                            timestamp_ms
-                                        );
                                         let _ = namespace_channels.realtime.send(data.clone());
 
                                         if should_aggregate(timestamp_ms, state.last_10s_ts, INTERVAL_10S) {
                                             if let Err(e) = db.insert_10s_aggregated(&data) {
                                                 log::error!(
-                                                    "Failed to store 10s aggregated data for {} (collector_instance_id: {}, round_id: {}): {}",
+                                                    "Failed to store 10s aggregated data for {}: {}",
                                                     namespace,
-                                                    scheduler_instance_id,
-                                                    round_id,
                                                     e
                                                 );
                                             }
@@ -301,10 +266,8 @@ impl TrafficCollector {
                                         if should_aggregate(timestamp_ms, state.last_1m_ts, INTERVAL_1M) {
                                             if let Err(e) = db.insert_1m_aggregated(&data) {
                                                 log::error!(
-                                                    "Failed to store 1m aggregated data for {} (collector_instance_id: {}, round_id: {}): {}",
+                                                    "Failed to store 1m aggregated data for {}: {}",
                                                     namespace,
-                                                    scheduler_instance_id,
-                                                    round_id,
                                                     e
                                                 );
                                             }
@@ -316,10 +279,8 @@ impl TrafficCollector {
                                         if should_aggregate(timestamp_ms, state.last_1h_ts, INTERVAL_1H) {
                                             if let Err(e) = db.insert_1h_aggregated(&data) {
                                                 log::error!(
-                                                    "Failed to store 1h aggregated data for {} (collector_instance_id: {}, round_id: {}): {}",
+                                                    "Failed to store 1h aggregated data for {}: {}",
                                                     namespace,
-                                                    scheduler_instance_id,
-                                                    round_id,
                                                     e
                                                 );
                                             }
@@ -331,10 +292,8 @@ impl TrafficCollector {
                                         if should_aggregate(timestamp_ms, state.last_1d_ts, INTERVAL_1D) {
                                             if let Err(e) = db.insert_1d_aggregated(&data) {
                                                 log::error!(
-                                                    "Failed to store 1d aggregated data for {} (collector_instance_id: {}, round_id: {}): {}",
+                                                    "Failed to store 1d aggregated data for {}: {}",
                                                     namespace,
-                                                    scheduler_instance_id,
-                                                    round_id,
                                                     e
                                                 );
                                             }
@@ -343,13 +302,7 @@ impl TrafficCollector {
                                     }
                                 }
                                 Err(e) => {
-                                    log::error!(
-                                        "Failed to collect data for {} (collector_instance_id: {}, round_id: {}): {}",
-                                        namespace,
-                                        scheduler_instance_id,
-                                        round_id,
-                                        e
-                                    );
+                                    log::error!("Failed to collect data for {}: {}", namespace, e);
                                 }
                             }
                         }
@@ -357,10 +310,7 @@ impl TrafficCollector {
                         collection_in_progress.store(false, Ordering::Release);
                     }
                     _ = shutdown_rx.recv() => {
-                        log::info!(
-                            "Collection scheduler stopped, collector_instance_id: {}",
-                            scheduler_instance_id
-                        );
+                        log::info!("Collection scheduler stopped");
                         break;
                     }
                 }

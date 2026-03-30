@@ -3,14 +3,11 @@ use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
 use crate::collector::TrafficCollector;
 use crate::database::Database;
 use crate::models::*;
-
-static SSE_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// HTTP 服务器
 pub struct HttpServerWrapper {
@@ -155,14 +152,11 @@ async fn sse_stream(
     // 根据时间跨度推导数据分辨率
     let resolution = Resolution::from_duration_minutes(duration_minutes);
 
-    let sse_connection_id = SSE_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-
     log::info!(
-        "SSE stream connected for namespace: {}, duration: {}min, resolution: {:?}, sse_connection_id: {}",
+        "SSE stream connected for namespace: {}, duration: {}min, resolution: {:?}",
         namespace,
         duration_minutes,
-        resolution,
-        sse_connection_id
+        resolution
     );
 
     // 精准订阅指定命名空间和分辨率的数据流
@@ -172,11 +166,7 @@ async fn sse_stream(
     let mut receiver = match receiver {
         Some(rx) => rx,
         None => {
-            log::warn!(
-                "Namespace not found for SSE stream: {}, sse_connection_id: {}",
-                namespace,
-                sse_connection_id
-            );
+            log::warn!("Namespace not found for SSE stream: {}", namespace);
             return HttpResponse::NotFound().body(format!("Namespace not found: {}", namespace));
         }
     };
@@ -189,26 +179,13 @@ async fn sse_stream(
 
     // 创建 SSE 流（精准订阅，计算速度后发送）
     let stream = async_stream::stream! {
-        log::info!(
-            "SSE stream started for namespace: {}, sse_connection_id: {}",
-            namespace,
-            sse_connection_id
-        );
+        log::info!("SSE stream started for namespace: {}", namespace);
         // 保存上一次的数据用于计算速度（初始化为数据库中的最新数据）
         let mut prev_data = initial_data;
 
         loop {
             match receiver.recv().await {
                 Ok(mut data) => {
-                    let timestamp_ms = data.timestamp_ms;
-                    log::info!(
-                        "SSE message received for namespace: {}, sse_connection_id: {}, timestamp_ms: {}, resolution: {:?}",
-                        namespace,
-                        sse_connection_id,
-                        timestamp_ms,
-                        data.resolution
-                    );
-
                     // 计算速度
                     calculate_interface_speeds(&mut data, prev_data.as_ref());
 
@@ -222,29 +199,15 @@ async fn sse_stream(
                     prev_data = Some(data);
 
                     if let Ok(json) = serde_json::to_string(&message) {
-                        log::debug!(
-                            "SSE message sent for namespace: {}, sse_connection_id: {}, timestamp_ms: {}",
-                            namespace,
-                            sse_connection_id,
-                            timestamp_ms
-                        );
                         yield Ok(web::Bytes::from(format!("data: {}\n\n", json))) as Result<web::Bytes, std::convert::Infallible>;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    log::info!(
-                        "SSE stream closed for namespace: {}, sse_connection_id: {}",
-                        namespace,
-                        sse_connection_id
-                    );
+                    log::info!("SSE stream closed for namespace: {}", namespace);
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    log::warn!(
-                        "SSE stream lagged for namespace: {}, sse_connection_id: {}, continuing",
-                        namespace,
-                        sse_connection_id
-                    );
+                    log::warn!("SSE stream lagged for namespace: {}, continuing", namespace);
                     // 继续接收，忽略滞后消息
                     continue;
                 }
