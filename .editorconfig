@@ -34,9 +34,7 @@ max_line_length = off
 indent_style = space
 indent_size = 2
 
-# Makefile
-[Makefile]
-indent_style = tab
+
 
 # Web files
 [*.html]

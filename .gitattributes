@@ -27,7 +27,6 @@ Dockerfile text eol=lf
 .dockerignore text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
-Makefile text eol=lf
 LICENSE text eol=lf
 
 # Service files

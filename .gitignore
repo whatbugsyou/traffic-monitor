@@ -35,8 +35,7 @@ nohup.out
 *.db-journal
 *.db-wal
 *.db-shm
-data/*.db
-data/*.db-*
+data/
 
 # Temporary files
 *.tmp
