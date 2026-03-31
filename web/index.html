@@ -291,89 +291,6 @@
       height: 350px;
     }
 
-    /* ── PPP0 丢包区 ── */
-    .ppp0-section {
-      background: white;
-      border-radius: 15px;
-      padding: 25px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
-      margin-bottom: 20px;
-    }
-
-    .ppp0-header {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      margin-bottom: 20px;
-    }
-
-    .ppp0-title {
-      font-size: 20px;
-      font-weight: 600;
-      color: #333;
-    }
-
-    .ppp0-status {
-      padding: 4px 14px;
-      border-radius: 20px;
-      font-size: 13px;
-      font-weight: 500;
-    }
-
-    .ppp0-status.available {
-      background: #d1fae5;
-      color: #065f46;
-    }
-
-    .ppp0-status.unavailable {
-      background: #fee2e2;
-      color: #991b1b;
-    }
-
-    .ppp0-status.unknown {
-      background: #f3f4f6;
-      color: #6b7280;
-    }
-
-    .loss-stats {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 20px;
-      margin-bottom: 20px;
-    }
-
-    .loss-stat-card {
-      background: #f9fafb;
-      border-radius: 10px;
-      padding: 15px;
-    }
-
-    .loss-stat-label {
-      font-size: 14px;
-      color: #666;
-      margin-bottom: 5px;
-    }
-
-    .loss-stat-value {
-      font-size: 24px;
-      font-weight: 700;
-      color: #333;
-    }
-
-    .loss-stat-value.rx {
-      color: #3b82f6;
-    }
-
-    .loss-stat-value.tx {
-      color: #10b981;
-    }
-
-    .loss-stat-sub {
-      font-size: 12px;
-      color: #999;
-      margin-top: 4px;
-    }
-
     /* ── 空态提示 ── */
     .empty-hint {
       text-align: center;
@@ -492,35 +409,6 @@
     <!-- ── 网卡图表区 ── -->
     <div id="interface-charts" class="charts-grid"></div>
 
-    <!-- ── PPP0 丢包区 ── -->
-    <div class="ppp0-section" id="ppp0-section" style="display:none;">
-      <div class="ppp0-header">
-        <div class="ppp0-title">📡 PPP0 接口丢包统计</div>
-        <div class="ppp0-status unknown" id="ppp0-status">检测中…</div>
-      </div>
-      <div class="loss-stats">
-        <div class="loss-stat-card">
-          <div class="loss-stat-label">📥 RX 每秒丢包</div>
-          <div class="loss-stat-value rx" id="rx-loss-per-sec-detail">0</div>
-          <div class="loss-stat-sub">包/秒</div>
-        </div>
-        <div class="loss-stat-card">
-          <div class="loss-stat-label">📤 TX 每秒丢包</div>
-          <div class="loss-stat-value tx" id="tx-loss-per-sec-detail">0</div>
-          <div class="loss-stat-sub">包/秒</div>
-        </div>
-        <div class="loss-stat-card">
-          <div class="loss-stat-label">📥 RX 累计丢包率</div>
-          <div class="loss-stat-value rx" id="rx-loss-rate-total">0%</div>
-        </div>
-        <div class="loss-stat-card">
-          <div class="loss-stat-label">📤 TX 累计丢包率</div>
-          <div class="loss-stat-value tx" id="tx-loss-rate-total">0%</div>
-        </div>
-      </div>
-      <div class="chart-container" id="loss-chart"></div>
-    </div>
-
     <!-- ── 未连接时的空态 ── -->
     <div class="chart-card" id="empty-state">
       <div class="empty-hint">
@@ -544,8 +432,6 @@
 
     const interfaceCharts = {};   // name → ECharts instance
     const interfaceData = {};   // name → { labels, rx, tx }
-    let lossChart = null;
-    const lossData = {labels: [], rxLoss: [], txLoss: []};
     let historyData = [];
     // 当前选择的时间范围（分钟）
     let currentDuration = 5;
@@ -567,7 +453,6 @@
     const $connectHint = document.getElementById('connect-hint');
     const $mainHeader = document.getElementById('main-header');
     const $statsSection = document.getElementById('stats-section');
-    const $ppp0Section = document.getElementById('ppp0-section');
     const $emptyState = document.getElementById('empty-state');
     const $interfaceCharts = document.getElementById('interface-charts');
 
@@ -644,14 +529,12 @@
       $emptyState.style.display = 'none';
       $mainHeader.style.display = '';
       $statsSection.style.display = '';
-      $ppp0Section.style.display = '';
     }
 
     function hideDataUI() {
       $emptyState.style.display = '';
       $mainHeader.style.display = 'none';
       $statsSection.style.display = 'none';
-      $ppp0Section.style.display = 'none';
     }
 
     /* ═══════════════════════════════════════════
@@ -756,47 +639,6 @@
     }
 
     /* ═══════════════════════════════════════════
-       图表 — 初始化丢包折线图
-    ═══════════════════════════════════════════ */
-    function initLossChart() {
-      if (lossChart) {lossChart.dispose();}
-      lossChart = echarts.init(document.getElementById('loss-chart'));
-
-      lossChart.setOption({
-        tooltip: {trigger: 'axis'},
-        legend: {data: ['RX丢包', 'TX丢包'], top: 0},
-        grid: {left: '3%', right: '4%', bottom: '3%', containLabel: true},
-        xAxis: {
-          type: 'category',
-          boundaryGap: false,
-          data: [],
-          // 3小时约10800个点，每600个点(10分钟)显示一个标签
-          axisLabel: {interval: 599, rotate: 0}
-        },
-        yAxis: {
-          type: 'value',
-          axisLabel: {formatter: (v) => v + ' 包'}
-        },
-        series: [
-          {
-            name: 'RX丢包', type: 'line', smooth: true, data: [],
-            sampling: 'lttb',
-            large: true,
-            largeThreshold: 1000,
-            itemStyle: {color: '#3b82f6'}
-          },
-          {
-            name: 'TX丢包', type: 'line', smooth: true, data: [],
-            sampling: 'lttb',
-            large: true,
-            largeThreshold: 1000,
-            itemStyle: {color: '#10b981'}
-          }
-        ]
-      });
-    }
-
-    /* ═══════════════════════════════════════════
        清空所有图表 & 数据
     ═══════════════════════════════════════════ */
     function clearCharts() {
@@ -808,12 +650,6 @@
       });
       $interfaceCharts.innerHTML = '';
 
-      // 重置丢包数据
-      lossData.labels = [];
-      lossData.rxLoss = [];
-      lossData.txLoss = [];
-      if (lossChart) {initLossChart();}
-
       // 重置历史
       historyData = [];
 
@@ -823,15 +659,8 @@
       document.getElementById('total-speed').innerHTML = statHtml({value: '0', unit: 'KB/s'});
       document.getElementById('rx-loss-per-sec').innerHTML = '0<span class="stat-unit">包/秒</span>';
       document.getElementById('tx-loss-per-sec').innerHTML = '0<span class="stat-unit">包/秒</span>';
-      document.getElementById('rx-loss-per-sec-detail').textContent = '0';
-      document.getElementById('tx-loss-per-sec-detail').textContent = '0';
-      document.getElementById('rx-loss-rate-total').textContent = '0%';
-      document.getElementById('tx-loss-rate-total').textContent = '0%';
       document.getElementById('last-update').textContent = '—';
       document.getElementById('data-points').textContent = '—';
-      const ps = document.getElementById('ppp0-status');
-      ps.textContent = '检测中…';
-      ps.className = 'ppp0-status unknown';
     }
 
     /* ═══════════════════════════════════════════
@@ -848,9 +677,6 @@
       Object.keys(interfaceData).forEach(k => {
         interfaceData[k] = {labels: [], rx: [], tx: [], rxDrop: [], txDrop: []};
       });
-      lossData.labels = [];
-      lossData.rxLoss = [];
-      lossData.txLoss = [];
 
       let totalRxSpeed = 0;
       let totalTxSpeed = 0;
@@ -879,21 +705,12 @@
             totalTxSpeed = txSpeed;
           }
 
-          // 丢包数据
-          if (data.rx_dropped_sum !== undefined) {
-            lossData.labels.push(time);
-            lossData.rxLoss.push(data.rx_dropped_sum || 0);
-            lossData.txLoss.push(data.tx_dropped_sum || 0);
-          }
         });
       } else {
         // 原始数据处理
         historyData.forEach((data, index) => {
           const isLast = index === historyData.length - 1;
           const time = new Date(data.timestamp).toLocaleTimeString();
-
-          let totalRxDroppedSpeed = 0;
-          let totalTxDroppedSpeed = 0;
 
           (data.interfaces || []).forEach(iface => {
             const name = iface.name;
@@ -912,16 +729,8 @@
             if (isLast) {
               totalRxSpeed += rxSpeed;
               totalTxSpeed += txSpeed;
-              // 汇总所有接口的丢包速度
-              totalRxDroppedSpeed += iface.rx_dropped_speed || 0;
-              totalTxDroppedSpeed += iface.tx_dropped_speed || 0;
             }
           });
-
-          // 丢包数据（汇总所有接口的丢包速度）
-          lossData.labels.push(time);
-          lossData.rxLoss.push(totalRxDroppedSpeed);
-          lossData.txLoss.push(totalTxDroppedSpeed);
         });
       }
 
@@ -938,17 +747,6 @@
         });
       });
 
-      // 更新丢包图表
-      if (lossChart) {
-        lossChart.setOption({
-          xAxis: {data: lossData.labels},
-          series: [
-            {data: lossData.rxLoss},
-            {data: lossData.txLoss}
-          ]
-        });
-      }
-
       // 更新统计卡片
       if (historyData.length > 0) {
         const latest = historyData[historyData.length - 1];
@@ -963,24 +761,15 @@
         $dataPoints.textContent = `${historyData.length} 个数据点`;
 
         // 更新丢包统计（汇总所有接口）
-        if (lossData.rxLoss.length > 0) {
-          const lastRx = lossData.rxLoss[lossData.rxLoss.length - 1];
-          const lastTx = lossData.txLoss[lossData.txLoss.length - 1];
+        if (latest.interfaces && latest.interfaces.length > 0) {
+          const lastRx = latest.interfaces.reduce((sum, iface) => sum + (iface.rx_dropped_speed || 0), 0);
+          const lastTx = latest.interfaces.reduce((sum, iface) => sum + (iface.tx_dropped_speed || 0), 0);
           document.getElementById('rx-loss-per-sec').innerHTML = `${lastRx}<span class="stat-unit">包/秒</span>`;
           document.getElementById('tx-loss-per-sec').innerHTML = `${lastTx}<span class="stat-unit">包/秒</span>`;
+        } else {
+          document.getElementById('rx-loss-per-sec').innerHTML = '0<span class="stat-unit">包/秒</span>';
+          document.getElementById('tx-loss-per-sec').innerHTML = '0<span class="stat-unit">包/秒</span>';
         }
-
-        // 计算所有接口的累计丢包率
-        let totalRxPackets = 0, totalTxPackets = 0;
-        let totalRxDropped = 0, totalTxDropped = 0;
-        (latest.interfaces || []).forEach(iface => {
-          totalRxDropped += iface.rx_dropped || 0;
-          totalTxDropped += iface.tx_dropped || 0;
-        });
-
-        // 隐藏 PPP0 专用区域（现在使用统一的丢包统计）
-        const ppp0Section = document.getElementById('ppp0-section');
-        if (ppp0Section) ppp0Section.style.display = 'none';
       }
     }
 
@@ -1154,7 +943,6 @@
         $connectHint.style.color = '#10b981';
 
         showDataUI();
-        initLossChart();
 
         // 选第一个命名空间并建立 SSE
         const firstNs = namespaces[0];
