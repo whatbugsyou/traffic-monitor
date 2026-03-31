@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -332,22 +332,6 @@ impl Database {
         }
     }
 
-    /// 根据时间范围获取历史数据（自动选择合适的表）
-    pub fn get_history_data(
-        &self,
-        namespace: &str,
-        start_time: &str,
-        end_time: &str,
-    ) -> Result<Vec<TrafficData>> {
-        let conn = self.conn.lock().unwrap();
-        let start_ts = parse_timestamp(start_time)?;
-        let end_ts = parse_timestamp(end_time)?;
-
-        let (table_name, _) = self.get_appropriate_table(start_ts, end_ts);
-
-        query_data_range(&conn, table_name, namespace, start_ts, end_ts)
-    }
-
     /// 根据持续时间获取历史数据
     pub fn get_history_by_duration(
         &self,
@@ -377,115 +361,6 @@ impl Database {
             since_ms,
             now_ms,
         )
-    }
-
-    /// 获取原始数据（详细数据）
-    pub fn get_raw_data(
-        &self,
-        namespace: &str,
-        start_time: &str,
-        end_time: &str,
-    ) -> Result<Vec<TrafficData>> {
-        self.get_history_data(namespace, start_time, end_time)
-    }
-
-    /// 获取10秒聚合数据
-    pub fn get_10s_data(
-        &self,
-        namespace: &str,
-        start_time: &str,
-        end_time: &str,
-    ) -> Result<Vec<TrafficData>> {
-        self.get_aggregated_data(namespace, start_time, end_time, "traffic_history_10s")
-    }
-
-    /// 获取1分钟聚合数据
-    pub fn get_1m_data(
-        &self,
-        namespace: &str,
-        start_time: &str,
-        end_time: &str,
-    ) -> Result<Vec<TrafficData>> {
-        self.get_aggregated_data(namespace, start_time, end_time, "traffic_history_1m")
-    }
-
-    /// 获取1小时聚合数据
-    pub fn get_1h_data(
-        &self,
-        namespace: &str,
-        start_time: &str,
-        end_time: &str,
-    ) -> Result<Vec<TrafficData>> {
-        self.get_aggregated_data(namespace, start_time, end_time, "traffic_history_1h")
-    }
-
-    /// 获取1天聚合数据
-    pub fn get_1d_data(
-        &self,
-        namespace: &str,
-        start_time: &str,
-        end_time: &str,
-    ) -> Result<Vec<TrafficData>> {
-        self.get_aggregated_data(namespace, start_time, end_time, "traffic_history_1d")
-    }
-
-    /// 获取聚合数据
-    fn get_aggregated_data(
-        &self,
-        namespace: &str,
-        start_time: &str,
-        end_time: &str,
-        table_name: &str,
-    ) -> Result<Vec<TrafficData>> {
-        let conn = self.conn.lock().unwrap();
-        let start_ts = parse_timestamp(start_time)?;
-        let end_ts = parse_timestamp(end_time)?;
-
-        query_data_range(&conn, table_name, namespace, start_ts, end_ts)
-    }
-
-    /// 获取最新的历史数据时间范围
-    pub fn get_latest_history_range(
-        &self,
-        namespace: &str,
-    ) -> Result<Option<(String, String)>> {
-        let conn = self.conn.lock().unwrap();
-
-        let tables = [
-            "traffic_history",
-            "traffic_history_10s",
-            "traffic_history_1m",
-            "traffic_history_1h",
-            "traffic_history_1d",
-        ];
-
-        for table in &tables {
-            if let Some((min_ts, max_ts)) = query_table_time_range(&conn, table, namespace)? {
-                return Ok(Some((
-                    format_timestamp(min_ts),
-                    format_timestamp(max_ts),
-                )));
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// 获取适合时间范围的表
-    fn get_appropriate_table(&self, start_ts: i64, end_ts: i64) -> (&'static str, i64) {
-        let duration_ms = end_ts - start_ts;
-
-        if duration_ms <= 10 * 60 * 1000 {
-            ("traffic_history", 1)
-        } else if duration_ms <= 60 * 60 * 1000 {
-            ("traffic_history_10s", 10)
-        } else if duration_ms <= 6 * 60 * 60 * 1000 {
-            ("traffic_history_1m", 60)
-        } else if duration_ms <= 24 * 60 * 60 * 1000 {
-            ("traffic_history_1h", 60 * 60)
-        } else {
-            ("traffic_history_1d", 24 * 60 * 60)
-        }
     }
 }
 
@@ -563,45 +438,7 @@ fn query_data_range(
     Ok(result)
 }
 
-fn query_table_time_range(
-    conn: &Connection,
-    table: &str,
-    namespace: &str,
-) -> Result<Option<(i64, i64)>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM {} WHERE namespace = ?1",
-        table
-    ))?;
 
-    let result = stmt
-        .query_row(params![namespace], |row| {
-            let min_ts: Option<i64> = row.get(0)?;
-            let max_ts: Option<i64> = row.get(1)?;
-            Ok((min_ts, max_ts))
-        })
-        .optional()?;
-
-    Ok(result.and_then(|(min_ts, max_ts)| match (min_ts, max_ts) {
-        (Some(min_ts), Some(max_ts)) => Some((min_ts, max_ts)),
-        _ => None,
-    }))
-}
-
-/// 解析时间戳字符串
-fn parse_timestamp(timestamp_str: &str) -> Result<i64> {
-    let dt = chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
-        .with_context(|| format!("Failed to parse timestamp: {}", timestamp_str))?;
-    Ok(Utc.from_utc_datetime(&dt).timestamp_millis())
-}
-
-/// 格式化时间戳
-fn format_timestamp(timestamp_ms: i64) -> String {
-    let dt = Utc
-        .timestamp_millis_opt(timestamp_ms)
-        .single()
-        .unwrap_or_else(|| Utc.timestamp_millis_opt(0).single().unwrap());
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
-}
 
 #[cfg(test)]
 mod tests {

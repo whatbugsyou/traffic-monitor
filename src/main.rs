@@ -1,6 +1,7 @@
 mod collector;
 mod database;
 mod models;
+mod netns;
 mod server;
 
 use anyhow::{Context, Result};

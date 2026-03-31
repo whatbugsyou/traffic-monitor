@@ -1,9 +1,8 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use chrono::Utc;
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,6 +12,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use crate::database::Database;
 use crate::models::*;
+use crate::netns;
 
 const INTERVAL_10S: i64 = 10_000; // 10秒（毫秒）
 const INTERVAL_1M: i64 = 60_000; // 1分钟（毫秒）
@@ -142,8 +142,7 @@ impl TrafficCollector {
                                 if *ns_guard != new_namespaces {
                                     log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, new_namespaces);
 
-                                    let active_namespaces: HashSet<&str> =
-                                        new_namespaces.iter().map(String::as_str).collect();
+
 
                                     let mut ch = channels.write().await;
                                     let mut agg = aggregation_state.write().await;
@@ -451,7 +450,7 @@ fn collect_namespace_data_blocking(namespace: &str) -> Result<TrafficData> {
     let timestamp = Utc::now();
     let namespace_name = namespace.to_string();
 
-    let interfaces = collect_interfaces_via_ip_netns_exec(namespace)?;
+    let interfaces = collect_interfaces_via_setns(namespace)?;
 
     Ok(TrafficData {
         namespace: namespace_name,
@@ -462,38 +461,20 @@ fn collect_namespace_data_blocking(namespace: &str) -> Result<TrafficData> {
     })
 }
 
-fn collect_interfaces_via_ip_netns_exec(namespace: &str) -> Result<Vec<InterfaceStats>> {
-    let output = if namespace == "default" {
-        Command::new("cat")
-            .arg("/proc/net/dev")
-            .output()
-            .context("Failed to execute cat /proc/net/dev")?
-    } else {
-        Command::new("ip")
-            .args(["netns", "exec", namespace, "cat", "/proc/net/dev"])
-            .output()
-            .with_context(|| format!("Failed to execute ip netns exec {} cat /proc/net/dev", namespace))?
-    };
+fn collect_interfaces_via_setns(namespace: &str) -> Result<Vec<InterfaceStats>> {
+    let content = netns::read_thread_net_dev_in_namespace(namespace).with_context(|| {
+        format!(
+            "failed to collect /proc/net/dev from namespace {} via in-process setns",
+            namespace
+        )
+    })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let message = if stderr.is_empty() {
-            format!("Command exited with status {}", output.status)
-        } else {
-            stderr
-        };
-
-        return Err(anyhow!(
-            "Failed to collect network data for namespace {}: {}",
-            namespace,
-            message
-        ));
-    }
-
-    let content = String::from_utf8(output.stdout)
-        .with_context(|| format!("Failed to decode /proc/net/dev output for namespace {}", namespace))?;
-
-    parse_interfaces_from_proc_net_dev(&content)
+    parse_interfaces_from_proc_net_dev(&content).with_context(|| {
+        format!(
+            "failed to parse /proc/net/dev content for namespace {}",
+            namespace
+        )
+    })
 }
 
 fn parse_interfaces_from_proc_net_dev(content: &str) -> Result<Vec<InterfaceStats>> {
