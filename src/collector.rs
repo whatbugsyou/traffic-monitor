@@ -1,12 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
 use std::path::Path;
-use std::sync::Arc;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::{Semaphore, broadcast, RwLock};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -17,6 +18,8 @@ const INTERVAL_10S: i64 = 10_000; // 10秒（毫秒）
 const INTERVAL_1M: i64 = 60_000; // 1分钟（毫秒）
 const INTERVAL_1H: i64 = 3_600_000; // 1小时（毫秒）
 const INTERVAL_1D: i64 = 86_400_000; // 1天（毫秒）
+const MAX_NAMESPACE_CONCURRENCY: usize = 20;
+
 
 /// 每个命名空间的多粒度广播通道
 struct ResolutionChannels {
@@ -95,47 +98,27 @@ impl TrafficCollector {
 
     /// 启动采集器
     pub async fn start(&self) -> Result<()> {
-        // 发现所有命名空间
         self.discover_namespaces().await?;
-
-        // 为每个命名空间创建多粒度广播通道和聚合状态
         self.ensure_namespace_runtime_state().await;
-
-        // 启动统一采集调度任务
         self.start_collection_scheduler().await?;
-
-        // 启动命名空间发现任务（定期检查新命名空间）
         self.start_namespace_discovery().await?;
-
         Ok(())
     }
 
     /// 发现所有命名空间
     async fn discover_namespaces(&self) -> Result<()> {
-        let mut namespaces = vec!["default".to_string()];
-
-        // 读取 /var/run/netns/ 目录
-        let netns_dir = Path::new("/var/run/netns");
-        if netns_dir.exists() {
-            let entries =
-                fs::read_dir(netns_dir).context("Failed to read /var/run/netns directory")?;
-
-            for entry in entries.flatten() {
-                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        namespaces.push(name.to_string());
-                    }
-                }
-            }
-        }
-
-        namespaces.sort();
-        namespaces.dedup();
+        let namespaces = scan_namespaces()?;
 
         let mut ns_guard = self.namespaces.write().await;
+        if *ns_guard != namespaces {
+            log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, namespaces);
+        }
         *ns_guard = namespaces;
 
         log::info!("Discovered {} namespaces", ns_guard.len());
+        drop(ns_guard);
+
+        self.ensure_namespace_runtime_state().await;
         Ok(())
     }
 
@@ -153,39 +136,31 @@ impl TrafficCollector {
             loop {
                 tokio::select! {
                     _ = check_interval.tick() => {
-                        // 重新发现命名空间
-                        let mut new_namespaces = vec!["default".to_string()];
+                        match scan_namespaces() {
+                            Ok(new_namespaces) => {
+                                let mut ns_guard = namespaces.write().await;
+                                if *ns_guard != new_namespaces {
+                                    log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, new_namespaces);
 
-                        if Path::new("/var/run/netns").exists() {
-                            if let Ok(entries) = fs::read_dir("/var/run/netns") {
-                                for entry in entries.flatten() {
-                                    if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                                        if let Some(name) = entry.file_name().to_str() {
-                                            new_namespaces.push(name.to_string());
+                                    let active_namespaces: HashSet<&str> =
+                                        new_namespaces.iter().map(String::as_str).collect();
+
+                                    let mut ch = channels.write().await;
+                                    let mut agg = aggregation_state.write().await;
+                                    for namespace in &new_namespaces {
+                                        if !ch.contains_key(namespace) {
+                                            ch.insert(namespace.clone(), ResolutionChannels::new());
+                                            log::info!("Created channels for new namespace: {}", namespace);
                                         }
+                                        agg.entry(namespace.clone()).or_insert_with(NamespaceAggregationState::default);
                                     }
+
+                                    *ns_guard = new_namespaces;
                                 }
                             }
-                        }
-
-                        new_namespaces.sort();
-                        new_namespaces.dedup();
-
-                        let mut ns_guard = namespaces.write().await;
-                        if *ns_guard != new_namespaces {
-                            log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, new_namespaces);
-
-                            let mut ch = channels.write().await;
-                            let mut agg = aggregation_state.write().await;
-                            for namespace in &new_namespaces {
-                                if !ch.contains_key(namespace) {
-                                    ch.insert(namespace.clone(), ResolutionChannels::new());
-                                    log::info!("Created channels for new namespace: {}", namespace);
-                                }
-                                agg.entry(namespace.clone()).or_insert_with(NamespaceAggregationState::default);
+                            Err(e) => {
+                                log::error!("Failed to refresh namespaces: {}", e);
                             }
-
-                            *ns_guard = new_namespaces;
                         }
                     }
                     _ = shutdown_rx.recv() => {
@@ -223,92 +198,88 @@ impl TrafficCollector {
                             continue;
                         }
 
+                        let _collection_guard = CollectionProgressGuard::new(Arc::clone(&collection_in_progress));
+                        let round_started_at = Instant::now();
                         let namespaces_snapshot = namespaces.read().await.clone();
 
-                        log::debug!(
-                            "Starting collection round for {} namespaces",
-                            namespaces_snapshot.len()
-                        );
-
                         let results = collect_namespace_round(&namespaces_snapshot).await;
+
+                        let mut raw_data: Vec<TrafficData> = Vec::new();
+                        let mut data_10s: Vec<TrafficData> = Vec::new();
+                        let mut data_1m: Vec<TrafficData> = Vec::new();
+                        let mut data_1h: Vec<TrafficData> = Vec::new();
+                        let mut data_1d: Vec<TrafficData> = Vec::new();
+                        let mut namespace_count = 0usize;
+                        let mut failures = 0usize;
 
                         for (namespace, result) in results {
                             match result {
                                 Ok(mut data) => {
+                                    namespace_count += 1;
                                     let timestamp_ms = data.timestamp_ms;
-
-                                    if let Err(e) = db.insert_traffic_data(&data) {
-                                        log::error!("Failed to store data for {}: {}", namespace, e);
-                                    }
 
                                     let mut state_guard = aggregation_state.write().await;
                                     let state = state_guard
                                         .entry(namespace.clone())
                                         .or_insert_with(NamespaceAggregationState::default);
 
-                                    let ch = channels.read().await;
-                                    if let Some(namespace_channels) = ch.get(&namespace) {
-                                        data.resolution = Some("1s".to_string());
+                                    let channels_guard = channels.read().await;
+                                    if let Some(namespace_channels) = channels_guard.get(&namespace) {
+                                        data.resolution = Some(Resolution::Realtime.as_str().to_string());
                                         let _ = namespace_channels.realtime.send(data.clone());
 
                                         if should_aggregate(timestamp_ms, state.last_10s_ts, INTERVAL_10S) {
-                                            if let Err(e) = db.insert_10s_aggregated(&data) {
-                                                log::error!(
-                                                    "Failed to store 10s aggregated data for {}: {}",
-                                                    namespace,
-                                                    e
-                                                );
-                                            }
                                             state.last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
-                                            data.resolution = Some("10s".to_string());
+                                            data.resolution = Some(Resolution::TenSeconds.as_str().to_string());
+                                            data_10s.push(data.clone());
                                             let _ = namespace_channels.agg_10s.send(data.clone());
                                         }
 
                                         if should_aggregate(timestamp_ms, state.last_1m_ts, INTERVAL_1M) {
-                                            if let Err(e) = db.insert_1m_aggregated(&data) {
-                                                log::error!(
-                                                    "Failed to store 1m aggregated data for {}: {}",
-                                                    namespace,
-                                                    e
-                                                );
-                                            }
                                             state.last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
-                                            data.resolution = Some("1m".to_string());
+                                            data.resolution = Some(Resolution::OneMinute.as_str().to_string());
+                                            data_1m.push(data.clone());
                                             let _ = namespace_channels.agg_1m.send(data.clone());
                                         }
 
                                         if should_aggregate(timestamp_ms, state.last_1h_ts, INTERVAL_1H) {
-                                            if let Err(e) = db.insert_1h_aggregated(&data) {
-                                                log::error!(
-                                                    "Failed to store 1h aggregated data for {}: {}",
-                                                    namespace,
-                                                    e
-                                                );
-                                            }
                                             state.last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
-                                            data.resolution = Some("1h".to_string());
+                                            data.resolution = Some(Resolution::OneHour.as_str().to_string());
+                                            data_1h.push(data.clone());
                                             let _ = namespace_channels.agg_1h.send(data.clone());
                                         }
 
                                         if should_aggregate(timestamp_ms, state.last_1d_ts, INTERVAL_1D) {
-                                            if let Err(e) = db.insert_1d_aggregated(&data) {
-                                                log::error!(
-                                                    "Failed to store 1d aggregated data for {}: {}",
-                                                    namespace,
-                                                    e
-                                                );
-                                            }
                                             state.last_1d_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1D));
+                                            data_1d.push(data.clone());
                                         }
+
+                                        raw_data.push(data);
                                     }
                                 }
                                 Err(e) => {
+                                    failures += 1;
                                     log::error!("Failed to collect data for {}: {}", namespace, e);
                                 }
                             }
                         }
 
-                        collection_in_progress.store(false, Ordering::Release);
+                        if let Err(e) = db.insert_round_batch(
+                            &raw_data,
+                            &data_10s,
+                            &data_1m,
+                            &data_1h,
+                            &data_1d,
+                        ) {
+                            log::error!("Failed to store round batch data: {}", e);
+                        }
+
+                        log::info!(
+                            "Collection round finished in {} ms for {} namespaces ({} failures)",
+                            round_started_at.elapsed().as_millis(),
+                            namespace_count,
+                            failures
+                        );
                     }
                     _ = shutdown_rx.recv() => {
                         log::info!("Collection scheduler stopped");
@@ -326,13 +297,16 @@ impl TrafficCollector {
         let mut channels = self.channels.write().await;
         let mut aggregation_state = self.aggregation_state.write().await;
 
-        for namespace in namespaces {
-            if !channels.contains_key(&namespace) {
+        for namespace in namespaces.iter() {
+            if !channels.contains_key(namespace) {
                 channels.insert(namespace.clone(), ResolutionChannels::new());
-                log::info!("Created multi-resolution channels for namespace: {}", namespace);
+                log::info!(
+                    "Created multi-resolution channels for namespace: {}",
+                    namespace
+                );
             }
             aggregation_state
-                .entry(namespace)
+                .entry(namespace.clone())
                 .or_insert_with(NamespaceAggregationState::default);
         }
     }
@@ -379,48 +353,82 @@ struct NamespaceAggregationState {
     last_1d_ts: Option<i64>,
 }
 
-async fn collect_namespace_round(namespaces: &[String]) -> Vec<(String, Result<TrafficData>)> {
-    if namespaces.is_empty() {
-        return Vec::new();
+struct CollectionProgressGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl CollectionProgressGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
     }
+}
 
-    let max_concurrency = namespaces.len().min(8).max(1);
-    let semaphore = Arc::new(Semaphore::new(max_concurrency));
-    let mut join_set = JoinSet::new();
-
-    for namespace in namespaces.iter().cloned() {
-        let semaphore = Arc::clone(&semaphore);
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .context("Failed to acquire namespace collection permit")?;
-            let result = collect_namespace_data(&namespace).await;
-            Ok::<_, anyhow::Error>((namespace, result))
-        });
+impl Drop for CollectionProgressGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
     }
+}
 
-    let mut results = Vec::with_capacity(namespaces.len());
+fn scan_namespaces() -> Result<Vec<String>> {
+    let mut namespaces = vec!["default".to_string()];
 
-    while let Some(joined) = join_set.join_next().await {
-        match joined {
-            Ok(Ok((namespace, result))) => results.push((namespace, result)),
-            Ok(Err(err)) => {
-                results.push((
-                    "unknown".to_string(),
-                    Err(err.context("Namespace collection task failed before execution")),
-                ));
-            }
-            Err(err) => {
-                results.push((
-                    "unknown".to_string(),
-                    Err(anyhow::anyhow!("Namespace collection task join failed: {}", err)),
-                ));
+    let netns_dir = Path::new("/var/run/netns");
+    if netns_dir.exists() {
+        let entries = fs::read_dir(netns_dir).context("Failed to read /var/run/netns directory")?;
+
+        for entry in entries.flatten() {
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    namespaces.push(name.to_string());
+                }
             }
         }
     }
 
-    results.sort_by(|a, b| a.0.cmp(&b.0));
+    namespaces.sort();
+    namespaces.dedup();
+    Ok(namespaces)
+}
+
+async fn collect_namespace_round(
+    namespaces: &[String],
+) -> Vec<(String, Result<TrafficData>)> {
+    let mut results = Vec::with_capacity(namespaces.len());
+    let semaphore = Arc::new(Semaphore::new(MAX_NAMESPACE_CONCURRENCY));
+    let mut join_set = JoinSet::new();
+    let collect_started_at = Instant::now();
+
+    for namespace in namespaces {
+        let namespace = namespace.clone();
+
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("collection semaphore closed unexpectedly");
+
+        join_set.spawn_blocking(move || {
+            let _permit = permit;
+            let result = collect_namespace_data_blocking(&namespace);
+            (namespace, result)
+        });
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok((namespace, result)) => results.push((namespace, result)),
+            Err(e) => {
+                log::error!("Collection task failed: {}", e);
+            }
+        }
+    }
+
+    log::debug!(
+        "Collection timing [round] collect_namespace_round finished in {} ms for {} namespaces",
+        collect_started_at.elapsed().as_millis(),
+        namespaces.len()
+    );
+
     results
 }
 
@@ -439,140 +447,102 @@ fn align_timestamp(timestamp_ms: i64, interval_ms: i64) -> i64 {
     (timestamp_ms / interval_ms) * interval_ms
 }
 
-/// 采集指定命名空间的数据
-async fn collect_namespace_data(namespace: &str) -> Result<TrafficData> {
-    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let timestamp_ms = Utc::now().timestamp_millis();
+fn collect_namespace_data_blocking(namespace: &str) -> Result<TrafficData> {
+    let timestamp = Utc::now();
+    let namespace_name = namespace.to_string();
 
-    // 采集接口数据
-    let interfaces = collect_interfaces(namespace).await?;
+    let interfaces = collect_interfaces_via_ip_netns_exec(namespace)?;
 
-    let data = TrafficData {
-        namespace: namespace.to_string(),
-        timestamp,
-        timestamp_ms,
+    Ok(TrafficData {
+        namespace: namespace_name,
+        timestamp: timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+        timestamp_ms: timestamp.timestamp_millis(),
         interfaces,
         resolution: None,
-    };
-
-    Ok(data)
+    })
 }
 
-/// 采集网络接口数据
-async fn collect_interfaces(namespace: &str) -> Result<Vec<InterfaceStats>> {
-    collect_interfaces_via_setns(namespace)
-}
-
-fn collect_interfaces_via_setns(namespace: &str) -> Result<Vec<InterfaceStats>> {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
-
-    let namespace = namespace.to_string();
-
-    log::debug!("Starting namespace collection for {}", namespace);
-
-    let original_ns = fs::File::open("/proc/self/ns/net")
-        .context("Failed to open current namespace")?;
-    let original_ns_fd = original_ns.as_raw_fd();
-
-    let target_ns = if namespace == "default" {
-        None
+fn collect_interfaces_via_ip_netns_exec(namespace: &str) -> Result<Vec<InterfaceStats>> {
+    let output = if namespace == "default" {
+        Command::new("cat")
+            .arg("/proc/net/dev")
+            .output()
+            .context("Failed to execute cat /proc/net/dev")?
     } else {
-        let target_path = format!("/var/run/netns/{}", namespace);
-        let target_ns = fs::File::open(&target_path)
-            .with_context(|| format!("Failed to open namespace: {}", target_path))?;
-
-        unsafe {
-            let ret = libc::setns(target_ns.as_raw_fd(), libc::CLONE_NEWNET);
-            if ret != 0 {
-                return Err(anyhow::anyhow!(
-                    "Failed to setns to {}: {}",
-                    namespace,
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-
-        Some(target_ns)
+        Command::new("ip")
+            .args(["netns", "exec", namespace, "cat", "/proc/net/dev"])
+            .output()
+            .with_context(|| format!("Failed to execute ip netns exec {} cat /proc/net/dev", namespace))?
     };
 
-    let result = (|| -> Result<Vec<InterfaceStats>> {
-        let mut net_dev_content = String::new();
-        fs::File::open("/proc/net/dev")
-            .context("Failed to open /proc/net/dev")?
-            .read_to_string(&mut net_dev_content)
-            .context("Failed to read /proc/net/dev")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if stderr.is_empty() {
+            format!("Command exited with status {}", output.status)
+        } else {
+            stderr
+        };
 
-        let mut interfaces = Vec::new();
-
-        for line in net_dev_content.lines().skip(2) {
-            let Some((dev_name_raw, stats_raw)) = line.split_once(':') else {
-                continue;
-            };
-
-            let dev_name = dev_name_raw.trim().to_string();
-
-            if dev_name == "lo" || dev_name.contains('.') || dev_name.contains('@') {
-                continue;
-            }
-
-            let fields: Vec<&str> = stats_raw.split_whitespace().collect();
-            if fields.len() < 16 {
-                continue;
-            }
-
-            let rx_bytes = fields[0]
-                .parse::<u64>()
-                .with_context(|| format!("Failed to parse rx_bytes for interface {}", dev_name))?;
-            let rx_dropped = fields[3]
-                .parse::<u64>()
-                .with_context(|| format!("Failed to parse rx_dropped for interface {}", dev_name))?;
-            let tx_bytes = fields[8]
-                .parse::<u64>()
-                .with_context(|| format!("Failed to parse tx_bytes for interface {}", dev_name))?;
-            let tx_dropped = fields[11]
-                .parse::<u64>()
-                .with_context(|| format!("Failed to parse tx_dropped for interface {}", dev_name))?;
-
-            interfaces.push(InterfaceStats {
-                name: dev_name,
-                rx_bytes,
-                tx_bytes,
-                rx_dropped,
-                tx_dropped,
-                rx_speed: None,
-                tx_speed: None,
-                rx_dropped_speed: None,
-                tx_dropped_speed: None,
-            });
-        }
-
-        Ok(interfaces)
-    })();
-
-    if target_ns.is_some() {
-        unsafe {
-            let ret = libc::setns(original_ns_fd, libc::CLONE_NEWNET);
-            if ret != 0 {
-                return Err(anyhow::anyhow!(
-                    "Failed to switch back to original namespace from {}: {}",
-                    namespace,
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
+        return Err(anyhow!(
+            "Failed to collect network data for namespace {}: {}",
+            namespace,
+            message
+        ));
     }
 
-    let interfaces = result?;
-    log::debug!(
-        "Completed collection for namespace: {}, total {} interfaces",
-        namespace,
-        interfaces.len()
-    );
-    Ok(interfaces)
+    let content = String::from_utf8(output.stdout)
+        .with_context(|| format!("Failed to decode /proc/net/dev output for namespace {}", namespace))?;
+
+    parse_interfaces_from_proc_net_dev(&content)
 }
 
+fn parse_interfaces_from_proc_net_dev(content: &str) -> Result<Vec<InterfaceStats>> {
+    let mut interfaces = Vec::new();
 
+    for line in content.lines().skip(2) {
+        let Some((dev_name_raw, stats_raw)) = line.split_once(':') else {
+            continue;
+        };
+
+        let dev_name = dev_name_raw.trim().to_string();
+
+        if dev_name == "lo" {
+            continue;
+        }
+
+        let fields: Vec<&str> = stats_raw.split_whitespace().collect();
+        if fields.len() < 16 {
+            continue;
+        }
+
+        let rx_bytes = fields[0]
+            .parse::<u64>()
+            .with_context(|| format!("Failed to parse rx_bytes for interface {}", dev_name))?;
+        let rx_dropped = fields[3]
+            .parse::<u64>()
+            .with_context(|| format!("Failed to parse rx_dropped for interface {}", dev_name))?;
+        let tx_bytes = fields[8]
+            .parse::<u64>()
+            .with_context(|| format!("Failed to parse tx_bytes for interface {}", dev_name))?;
+        let tx_dropped = fields[11]
+            .parse::<u64>()
+            .with_context(|| format!("Failed to parse tx_dropped for interface {}", dev_name))?;
+
+        interfaces.push(InterfaceStats {
+            name: dev_name,
+            rx_bytes,
+            tx_bytes,
+            rx_dropped,
+            tx_dropped,
+            rx_speed: None,
+            tx_speed: None,
+            rx_dropped_speed: None,
+            tx_dropped_speed: None,
+        });
+    }
+
+    Ok(interfaces)
+}
 
 #[cfg(test)]
 mod tests {
@@ -580,12 +550,10 @@ mod tests {
 
     #[test]
     fn test_align_timestamp() {
-        // 测试10秒对齐
         assert_eq!(align_timestamp(12345, INTERVAL_10S), 10000);
         assert_eq!(align_timestamp(19999, INTERVAL_10S), 10000);
         assert_eq!(align_timestamp(20000, INTERVAL_10S), 20000);
 
-        // 测试1分钟对齐
         assert_eq!(align_timestamp(12345, INTERVAL_1M), 0);
         assert_eq!(align_timestamp(60000, INTERVAL_1M), 60000);
         assert_eq!(align_timestamp(119999, INTERVAL_1M), 60000);
@@ -594,14 +562,34 @@ mod tests {
 
     #[test]
     fn test_should_aggregate() {
-        // 第一次应该聚合
         assert!(should_aggregate(10000, None, INTERVAL_10S));
-
-        // 同一个时间窗口内不应该再次聚合
         assert!(!should_aggregate(15000, Some(10000), INTERVAL_10S));
-
-        // 进入下一个时间窗口应该聚合
         assert!(should_aggregate(20000, Some(10000), INTERVAL_10S));
         assert!(should_aggregate(25000, Some(10000), INTERVAL_10S));
     }
+
+    #[test]
+    fn test_parse_interfaces_from_proc_net_dev() {
+        let content = r#"
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 100 1 0 2 0 0 0 0 200 3 0 4 0 0 0 0
+  eth0: 1000 10 0 1 0 0 0 0 2000 20 0 2 0 0 0 0
+ eth0.1: 500 5 0 0 0 0 0 0 600 6 0 0 0 0 0 0
+veth1234@if5: 700 7 0 0 0 0 0 0 800 8 0 0 0 0 0 0
+"#;
+
+        let interfaces = parse_interfaces_from_proc_net_dev(content).unwrap();
+
+        assert_eq!(interfaces.len(), 3);
+        assert_eq!(interfaces[0].name, "eth0");
+        assert_eq!(interfaces[0].rx_bytes, 1000);
+        assert_eq!(interfaces[0].tx_bytes, 2000);
+        assert_eq!(interfaces[0].rx_dropped, 1);
+        assert_eq!(interfaces[0].tx_dropped, 2);
+
+        assert_eq!(interfaces[1].name, "eth0.1");
+        assert_eq!(interfaces[2].name, "veth1234@if5");
+    }
+
 }
