@@ -372,6 +372,10 @@
           <span class="resolution-badge" id="resolution-label">(1秒/点)</span>
         </div>
         <div class="info-item">
+          <strong>时区：</strong>
+          <span id="current-timezone">—</span>
+        </div>
+        <div class="info-item">
           <strong>最后更新：</strong>
           <span id="last-update">—</span>
         </div>
@@ -429,6 +433,7 @@
     let currentNs = '';
     let eventSource = null;
     let currentStreamToken = 0;
+    const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
 
     const interfaceCharts = {};   // name → ECharts instance
     const interfaceData = {};   // name → { labels, rx, tx }
@@ -686,7 +691,10 @@
         // 聚合数据处理
         historyData.forEach((data, index) => {
           const isLast = index === historyData.length - 1;
-          const time = new Date(data.timestamp).toLocaleTimeString();
+          const time = new Date(data.timestamp_ms).toLocaleString('zh-CN', {
+            timeZone: browserTimeZone,
+            hour12: false
+          });
 
           // 聚合数据直接包含平均速度
           const rxSpeed = data.rx_speed_avg || 0;
@@ -710,7 +718,10 @@
         // 原始数据处理
         historyData.forEach((data, index) => {
           const isLast = index === historyData.length - 1;
-          const time = new Date(data.timestamp).toLocaleTimeString();
+          const time = new Date(data.timestamp_ms).toLocaleString('zh-CN', {
+            timeZone: browserTimeZone,
+            hour12: false
+          });
 
           (data.interfaces || []).forEach(iface => {
             const name = iface.name;
@@ -757,7 +768,11 @@
         document.getElementById('download-speed').innerHTML = statHtml(dlSpeed);
         document.getElementById('upload-speed').innerHTML = statHtml(ulSpeed);
         document.getElementById('total-speed').innerHTML = statHtml(totSpeed);
-        document.getElementById('last-update').textContent = latest.timestamp;
+        document.getElementById('current-timezone').textContent = browserTimeZone;
+        document.getElementById('last-update').textContent = new Date(latest.timestamp_ms).toLocaleString('zh-CN', {
+          timeZone: browserTimeZone,
+          hour12: false
+        });
         $dataPoints.textContent = `${historyData.length} 个数据点`;
 
         // 更新丢包统计（汇总所有接口）
