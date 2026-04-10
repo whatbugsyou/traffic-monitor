@@ -77,3 +77,6 @@ doc/
 # Project-specific
 bin/
 .zed/
+
+# Cargo local cache
+.cargo-local/
