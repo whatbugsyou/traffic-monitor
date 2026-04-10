@@ -3,6 +3,8 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "workspaceFolder": "/workspace",
   "containerEnv": {
     "HTTP_PROXY": "http://host.docker.internal:7890",
     "HTTPS_PROXY": "http://host.docker.internal:7890",
@@ -22,7 +24,7 @@
     }
   },
   "forwardPorts": [
-    8080
+    19090
   ],
   "runArgs": [
     "--privileged"

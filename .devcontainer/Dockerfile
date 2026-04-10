@@ -1,4 +1,6 @@
-FROM rust:1.82
+FROM rust:latest
+ENV PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LABEL devcontainer.metadata="[{}]"
 
 # 设置时区
 ENV TZ=Asia/Shanghai
@@ -14,6 +16,21 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+# 确保 Cargo PATH 在登录和交互式 shell 中生效
+RUN printf '%s\n' \
+    'case ":$PATH:" in' \
+    '  *:/usr/local/cargo/bin:*) ;;' \
+    '  *) export PATH=/usr/local/cargo/bin:$PATH ;;' \
+    'esac' \
+    > /etc/profile.d/cargo-path.sh \
+    && printf '%s\n' \
+    '' \
+    'case ":$PATH:" in' \
+    '  *:/usr/local/cargo/bin:*) ;;' \
+    '  *) export PATH=/usr/local/cargo/bin:$PATH ;;' \
+    'esac' \
+    >> /etc/bash.bashrc
 
 # 设置工作目录
 WORKDIR /workspace
