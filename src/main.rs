@@ -1,6 +1,7 @@
 mod collector;
 mod database;
 mod models;
+mod netlink_client;
 mod netns;
 mod server;
 
@@ -14,17 +15,14 @@ use crate::server::HttpServerWrapper;
 
 #[actix_rt::main]
 async fn main() -> Result<()> {
-    // 初始化日志
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!("========================================");
     log::info!("Traffic Monitor Server (Rust)");
     log::info!("========================================");
 
-    // 加载配置
     let db_config = DatabaseConfig::default();
     let collector_config = CollectorConfig::default();
-
     let server_config = ServerConfig::default();
 
     log::info!("Configuration loaded:");
@@ -32,26 +30,22 @@ async fn main() -> Result<()> {
     log::info!("  Server: {}:{}", server_config.host, server_config.port);
     log::info!("  Collection interval: {}s", collector_config.interval_secs);
 
-    // 创建数据库
     log::info!("Initializing database...");
     let db = Arc::new(Database::new(db_config).context("Failed to initialize database")?);
     log::info!("Database initialized successfully");
 
-    // 创建采集器
     log::info!("Starting traffic collector...");
     let collector = Arc::new(
         TrafficCollector::new(Arc::clone(&db), collector_config)
             .context("Failed to create traffic collector")?,
     );
 
-    // 启动采集器
     collector
         .start()
         .await
         .context("Failed to start traffic collector")?;
     log::info!("Traffic collector started");
 
-    // 创建 HTTP 服务器
     log::info!("Starting HTTP server...");
     let http_server =
         HttpServerWrapper::new(server_config, Arc::clone(&db), Arc::clone(&collector));
@@ -70,14 +64,12 @@ async fn main() -> Result<()> {
     log::info!("");
     log::info!("Press Ctrl+C to stop the server");
 
-    // 启动 HTTP 服务器（使用 actix 的信号处理）
     if let Err(e) = http_server.start().await {
         log::error!("HTTP server error: {}", e);
     }
 
-    // 服务器关闭后停止采集器
     log::info!("Stopping traffic collector...");
-    if let Err(e) = collector.stop() {
+    if let Err(e) = collector.stop().await {
         log::error!("Failed to stop collector: {}", e);
     } else {
         log::info!("Traffic collector stopped");

@@ -1,17 +1,9 @@
 use anyhow::{anyhow, Context, Result};
-use std::fs;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
 pub fn current_tid() -> libc::pid_t {
     unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
-}
-
-
-
-pub fn read_thread_net_dev(tid: libc::pid_t) -> Result<String> {
-    let path = format!("/proc/self/task/{}/net/dev", tid);
-    fs::read_to_string(&path).with_context(|| format!("failed to read {}", path))
 }
 
 pub struct NamespaceGuard {
@@ -28,8 +20,8 @@ impl NamespaceGuard {
         }
 
         let original_tid = current_tid();
-        let original_ns = File::open("/proc/self/ns/net")
-            .context("failed to open current network namespace")?;
+        let original_ns =
+            File::open("/proc/self/ns/net").context("failed to open current network namespace")?;
         let target_path = format!("/var/run/netns/{}", namespace);
         let target_ns = File::open(&target_path)
             .with_context(|| format!("failed to open target network namespace {}", target_path))?;
@@ -85,12 +77,16 @@ impl Drop for NamespaceGuard {
     }
 }
 
-pub fn read_thread_net_dev_in_namespace(namespace: &str) -> Result<String> {
+pub fn run_in_namespace<T, F>(namespace: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
     let tid = current_tid();
     let _guard = NamespaceGuard::enter(namespace)?;
-    read_thread_net_dev(tid).with_context(|| {
+
+    f().with_context(|| {
         format!(
-            "failed to read thread network stats for namespace {} on tid {}",
+            "failed to execute operation in namespace {} on tid {}",
             namespace, tid
         )
     })
