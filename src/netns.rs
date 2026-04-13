@@ -1,11 +1,20 @@
 use anyhow::{anyhow, Context, Result};
+
+#[cfg(target_os = "linux")]
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
+// ============================================================================
+// Linux 实现
+// ============================================================================
+
+#[cfg(target_os = "linux")]
 pub fn current_tid() -> libc::pid_t {
     unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
 }
 
+#[cfg(target_os = "linux")]
 pub struct NamespaceGuard {
     original_ns: File,
     original_tid: libc::pid_t,
@@ -13,6 +22,7 @@ pub struct NamespaceGuard {
     restored: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl NamespaceGuard {
     pub fn enter(namespace: &str) -> Result<Option<Self>> {
         if namespace == "default" {
@@ -65,6 +75,7 @@ impl NamespaceGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for NamespaceGuard {
     fn drop(&mut self) {
         if self.restored {
@@ -77,6 +88,7 @@ impl Drop for NamespaceGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn run_in_namespace<T, F>(namespace: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
@@ -90,4 +102,59 @@ where
             namespace, tid
         )
     })
+}
+
+// ============================================================================
+// 非 Linux 平台 stub 实现
+// ============================================================================
+
+#[cfg(not(target_os = "linux"))]
+pub fn current_tid() -> libc::pid_t {
+    // 非 Linux 平台不支持 gettid，返回进程 ID 作为替代
+    unsafe { libc::getpid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub struct NamespaceGuard {
+    _target_namespace: Option<String>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl NamespaceGuard {
+    pub fn enter(namespace: &str) -> Result<Option<Self>> {
+        if namespace == "default" {
+            return Ok(None);
+        }
+
+        // 非 Linux 平台不支持网络命名空间
+        Err(anyhow!(
+            "network namespaces are only supported on Linux (requested: {})",
+            namespace
+        ))
+    }
+
+    pub fn restore(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for NamespaceGuard {
+    fn drop(&mut self) {}
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_in_namespace<T, F>(namespace: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    if namespace != "default" {
+        return Err(anyhow!(
+            "network namespaces are only supported on Linux (requested: {})",
+            namespace
+        ));
+    }
+
+    // 对于 default 命名空间，直接执行函数
+    f()
 }
