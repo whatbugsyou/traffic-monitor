@@ -1,77 +1,138 @@
 use serde::{Deserialize, Serialize};
 
-/// 网络接口统计信息
+/// 原始网络接口统计数据（从 netlink 直接获取）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InterfaceStats {
+pub struct RawInterfaceStats {
+    /// 接口名称
     pub name: String,
+    /// 接收字节数（累计值）
     pub rx_bytes: u64,
+    /// 发送字节数（累计值）
     pub tx_bytes: u64,
     /// 接收丢包数（累计值）
     pub rx_dropped: u64,
     /// 发送丢包数（累计值）
     pub tx_dropped: u64,
-    /// 接收速度 (bytes/s)，查询时计算
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_speed: Option<u64>,
-    /// 发送速度 (bytes/s)，查询时计算
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_speed: Option<u64>,
-    /// 接收丢包速度 (包/s)，查询时计算
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_dropped_speed: Option<u64>,
-    /// 发送丢包速度 (包/s)，查询时计算
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_dropped_speed: Option<u64>,
 }
 
-/// 数据分辨率
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Resolution {
-    /// 实时数据（1秒粒度）
-    Realtime,
-    /// 10秒聚合
-    TenSeconds,
-    /// 1分钟聚合
-    OneMinute,
-    /// 1小时聚合
-    OneHour,
-}
-
-impl Resolution {
-    /// 从时间跨度（分钟）推导合适的分辨率
-    pub fn from_duration_minutes(duration_minutes: u32) -> Self {
-        match duration_minutes {
-            0..=5 => Resolution::Realtime,      // ≤ 5分钟：实时数据
-            6..=60 => Resolution::TenSeconds,   // 5-60分钟：10秒聚合
-            61..=1440 => Resolution::OneMinute, // 1-24小时：1分钟聚合
-            _ => Resolution::OneHour,           // > 24小时：1小时聚合
-        }
-    }
-
-    /// 获取分辨率的字符串表示
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Resolution::Realtime => "1s",
-            Resolution::TenSeconds => "10s",
-            Resolution::OneMinute => "1m",
-            Resolution::OneHour => "1h",
-        }
-    }
-}
-
-/// 流量数据（原始快照）
+/// 原始流量数据快照（采集层直接产出）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrafficData {
+pub struct RawTrafficData {
+    /// 网络命名空间名称
     pub namespace: String,
+    /// 时间戳字符串（格式: "%Y-%m-%d %H:%M:%S"）
     pub timestamp: String,
+    /// 毫秒级时间戳
     pub timestamp_ms: i64,
-    pub interfaces: Vec<InterfaceStats>,
-    /// 数据分辨率：1s, 10s, 1m
+    /// 接口统计列表
+    pub interfaces: Vec<RawInterfaceStats>,
+    /// 数据分辨率（原始数据为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution: Option<String>,
 }
 
+/// 网络接口统计信息（带计算速度，用于 API 返回）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceStats {
+    /// 接口名称
+    pub name: String,
+    /// 接收字节数（累计值）
+    pub rx_bytes: u64,
+    /// 发送字节数（累计值）
+    pub tx_bytes: u64,
+    /// 接收丢包数（累计值）
+    pub rx_dropped: u64,
+    /// 发送丢包数（累计值）
+    pub tx_dropped: u64,
+    /// 接收速度，查询时计算
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_speed: Option<u64>,
+    /// 发送速度，查询时计算
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_speed: Option<u64>,
+    /// 接收丢包速度（包/s），查询时计算
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_dropped_speed: Option<u64>,
+    /// 发送丢包速度（包/s），查询时计算
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_dropped_speed: Option<u64>,
+}
+
+/// 流量数据（带计算速度，用于 API 返回）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrafficData {
+    /// 网络命名空间名称
+    pub namespace: String,
+    /// 时间戳字符串（格式: "%Y-%m-%d %H:%M:%S"）
+    pub timestamp: String,
+    /// 毫秒级时间戳
+    pub timestamp_ms: i64,
+    /// 接口统计列表
+    pub interfaces: Vec<InterfaceStats>,
+    /// 数据分辨率：1s, 10s, 1m, 1h
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+}
+
+// ============================================================================
+// 类型转换实现
+// ============================================================================
+
+impl From<RawInterfaceStats> for InterfaceStats {
+    fn from(raw: RawInterfaceStats) -> Self {
+        InterfaceStats {
+            name: raw.name,
+            rx_bytes: raw.rx_bytes,
+            tx_bytes: raw.tx_bytes,
+            rx_dropped: raw.rx_dropped,
+            tx_dropped: raw.tx_dropped,
+            rx_speed: None,
+            tx_speed: None,
+            rx_dropped_speed: None,
+            tx_dropped_speed: None,
+        }
+    }
+}
+
+impl From<RawTrafficData> for TrafficData {
+    fn from(raw: RawTrafficData) -> Self {
+        TrafficData {
+            namespace: raw.namespace,
+            timestamp: raw.timestamp,
+            timestamp_ms: raw.timestamp_ms,
+            interfaces: raw
+                .interfaces
+                .into_iter()
+                .map(InterfaceStats::from)
+                .collect(),
+            resolution: raw.resolution,
+        }
+    }
+}
+
+impl InterfaceStats {
+    /// 从原始数据创建，保留累计值，速度字段初始化为 None
+    pub fn from_raw(raw: RawInterfaceStats) -> Self {
+        Self::from(raw)
+    }
+}
+
+impl TrafficData {
+    /// 从原始数据创建
+    pub fn from_raw(raw: RawTrafficData) -> Self {
+        Self::from(raw)
+    }
+}
+
+// ============================================================================
+// 速度计算函数
+// ============================================================================
+
 /// 计算接口速度（基于前后数据的字节差和时间差）
+///
+/// # Arguments
+/// * `current` - 当前数据（会被修改，填充速度字段）
+/// * `prev` - 前一次数据（用于计算差值）
 pub fn calculate_interface_speeds(current: &mut TrafficData, prev: Option<&TrafficData>) {
     if let Some(prev) = prev {
         let interval_ms = current.timestamp_ms - prev.timestamp_ms;
@@ -117,12 +178,57 @@ pub fn calculate_interface_speeds(current: &mut TrafficData, prev: Option<&Traff
 pub fn calculate_speeds_for_list(data_list: &mut [TrafficData]) {
     for i in 0..data_list.len() {
         if i > 0 {
-            // 获取前后数据的引用（需要 unsafe 因为 Rust 不允许同时可变和不可变引用）
             // 使用 split_at_mut 来安全地分割切片
             let (left, right) = data_list.split_at_mut(i);
             let prev = &left[i - 1];
             let current = &mut right[0];
             calculate_interface_speeds(current, Some(prev));
+        }
+    }
+}
+
+/// 计算原始数据列表的速度，返回带速度的 TrafficData 列表
+pub fn calculate_speeds_from_raw_list(raw_list: &[RawTrafficData]) -> Vec<TrafficData> {
+    let mut result: Vec<TrafficData> = raw_list.iter().cloned().map(TrafficData::from).collect();
+    calculate_speeds_for_list(&mut result);
+    result
+}
+
+// ============================================================================
+// 其他数据结构
+// ============================================================================
+
+/// 数据分辨率
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Resolution {
+    /// 实时数据（1秒粒度）
+    Realtime,
+    /// 10秒聚合
+    TenSeconds,
+    /// 1分钟聚合
+    OneMinute,
+    /// 1小时聚合
+    OneHour,
+}
+
+impl Resolution {
+    /// 从时间跨度（分钟）推导合适的分辨率
+    pub fn from_duration_minutes(duration_minutes: u32) -> Self {
+        match duration_minutes {
+            0..=5 => Resolution::Realtime,      // ≤ 5分钟：实时数据
+            6..=60 => Resolution::TenSeconds,   // 5-60分钟：10秒聚合
+            61..=1440 => Resolution::OneMinute, // 1-24小时：1分钟聚合
+            _ => Resolution::OneHour,           // > 24小时：1小时聚合
+        }
+    }
+
+    /// 获取分辨率的字符串表示
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Resolution::Realtime => "1s",
+            Resolution::TenSeconds => "10s",
+            Resolution::OneMinute => "1m",
+            Resolution::OneHour => "1h",
         }
     }
 }
@@ -201,5 +307,98 @@ impl Default for ServerConfig {
             port: 19090,
             web_root: "web".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_raw_interface_stats_to_interface_stats() {
+        let raw = RawInterfaceStats {
+            name: "eth0".to_string(),
+            rx_bytes: 1000,
+            tx_bytes: 2000,
+            rx_dropped: 10,
+            tx_dropped: 20,
+        };
+
+        let stats: InterfaceStats = raw.into();
+
+        assert_eq!(stats.name, "eth0");
+        assert_eq!(stats.rx_bytes, 1000);
+        assert_eq!(stats.tx_bytes, 2000);
+        assert_eq!(stats.rx_dropped, 10);
+        assert_eq!(stats.tx_dropped, 20);
+        assert!(stats.rx_speed.is_none());
+        assert!(stats.tx_speed.is_none());
+        assert!(stats.rx_dropped_speed.is_none());
+        assert!(stats.tx_dropped_speed.is_none());
+    }
+
+    #[test]
+    fn test_calculate_speeds() {
+        let prev = RawTrafficData {
+            namespace: "default".to_string(),
+            timestamp: "2024-01-01 00:00:00".to_string(),
+            timestamp_ms: 1000,
+            interfaces: vec![RawInterfaceStats {
+                name: "eth0".to_string(),
+                rx_bytes: 1000,
+                tx_bytes: 2000,
+                rx_dropped: 10,
+                tx_dropped: 20,
+            }],
+            resolution: None,
+        };
+
+        let curr = RawTrafficData {
+            namespace: "default".to_string(),
+            timestamp: "2024-01-01 00:00:01".to_string(),
+            timestamp_ms: 2000,
+            interfaces: vec![RawInterfaceStats {
+                name: "eth0".to_string(),
+                rx_bytes: 2000,
+                tx_bytes: 4000,
+                rx_dropped: 15,
+                tx_dropped: 25,
+            }],
+            resolution: None,
+        };
+
+        let mut curr_data = TrafficData::from(curr);
+        let prev_data = TrafficData::from(prev);
+
+        calculate_interface_speeds(&mut curr_data, Some(&prev_data));
+
+        let iface = &curr_data.interfaces[0];
+        assert_eq!(iface.rx_speed, Some(1000)); // (2000-1000) * 1000 / 1000
+        assert_eq!(iface.tx_speed, Some(2000)); // (4000-2000) * 1000 / 1000
+        assert_eq!(iface.rx_dropped_speed, Some(5)); // (15-10) * 1000 / 1000
+        assert_eq!(iface.tx_dropped_speed, Some(5)); // (25-20) * 1000 / 1000
+    }
+
+    #[test]
+    fn test_resolution_from_duration() {
+        assert_eq!(Resolution::from_duration_minutes(1), Resolution::Realtime);
+        assert_eq!(Resolution::from_duration_minutes(5), Resolution::Realtime);
+        assert_eq!(
+            Resolution::from_duration_minutes(10),
+            Resolution::TenSeconds
+        );
+        assert_eq!(
+            Resolution::from_duration_minutes(60),
+            Resolution::TenSeconds
+        );
+        assert_eq!(
+            Resolution::from_duration_minutes(120),
+            Resolution::OneMinute
+        );
+        assert_eq!(
+            Resolution::from_duration_minutes(1440),
+            Resolution::OneMinute
+        );
+        assert_eq!(Resolution::from_duration_minutes(1500), Resolution::OneHour);
     }
 }

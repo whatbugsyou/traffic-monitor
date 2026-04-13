@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::models::*;
+use crate::models::{DatabaseConfig, RawTrafficData, TrafficData};
 
 /// 数据库管理器
 #[derive(Debug)]
@@ -254,14 +254,14 @@ impl Database {
         Ok(())
     }
 
-    /// 插入一轮采集产生的所有数据
+    /// 插入一轮采集产生的所有数据（原始累计值）
     pub fn insert_round_batch(
         &self,
-        raw_data: &[TrafficData],
-        data_10s: &[TrafficData],
-        data_1m: &[TrafficData],
-        data_1h: &[TrafficData],
-        data_1d: &[TrafficData],
+        raw_data: &[RawTrafficData],
+        data_10s: &[RawTrafficData],
+        data_1m: &[RawTrafficData],
+        data_1h: &[RawTrafficData],
+        data_1d: &[RawTrafficData],
     ) -> Result<()> {
         let started_at = Instant::now();
         let mut conn = self.conn.lock().unwrap();
@@ -302,7 +302,7 @@ impl Database {
         Ok(())
     }
 
-    /// 获取当前数据（最新的数据）
+    /// 获取当前数据（最新的数据，转换为带速度字段的 TrafficData）
     pub fn get_current_data(&self, namespace: &str) -> Result<Option<TrafficData>> {
         let conn = self.conn.lock().unwrap();
 
@@ -324,9 +324,10 @@ impl Database {
 
         match result {
             Some(data_json) => {
-                let data: TrafficData = serde_json::from_str(&data_json)
-                    .context("Failed to deserialize traffic data")?;
-                Ok(Some(data))
+                // 从数据库读取原始数据，转换为 TrafficData
+                let raw_data: RawTrafficData = serde_json::from_str(&data_json)
+                    .context("Failed to deserialize raw traffic data")?;
+                Ok(Some(TrafficData::from(raw_data)))
             }
             None => Ok(None),
         }
@@ -354,17 +355,11 @@ impl Database {
         };
 
         let conn = self.conn.lock().unwrap();
-        query_data_range(
-            &conn,
-            table_name,
-            namespace,
-            since_ms,
-            now_ms,
-        )
+        query_data_range(&conn, table_name, namespace, since_ms, now_ms)
     }
 }
 
-fn serialize_payloads(data_list: &[TrafficData]) -> Result<Vec<(String, String, i64, String)>> {
+fn serialize_payloads(data_list: &[RawTrafficData]) -> Result<Vec<(String, String, i64, String)>> {
     data_list
         .iter()
         .map(|data| {
@@ -372,7 +367,7 @@ fn serialize_payloads(data_list: &[TrafficData]) -> Result<Vec<(String, String, 
                 data.namespace.clone(),
                 data.timestamp.clone(),
                 data.timestamp_ms,
-                serde_json::to_string(data).context("Failed to serialize traffic data")?,
+                serde_json::to_string(data).context("Failed to serialize raw traffic data")?,
             ))
         })
         .collect()
@@ -419,14 +414,15 @@ fn query_data_range(
     let rows = stmt
         .query_map(params![namespace, start_ts, end_ts], |row| {
             let data_json: String = row.get(0)?;
-            let data: TrafficData = serde_json::from_str(&data_json).map_err(|e| {
+            // 从数据库读取原始数据，转换为 TrafficData
+            let raw_data: RawTrafficData = serde_json::from_str(&data_json).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?;
-            Ok(data)
+            Ok(TrafficData::from(raw_data))
         })
         .context("Failed to query history data")?;
 
@@ -437,8 +433,6 @@ fn query_data_range(
 
     Ok(result)
 }
-
-
 
 #[cfg(test)]
 mod tests {

@@ -16,7 +16,7 @@ use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::database::Database;
-use crate::models::*;
+use crate::models::{CollectorConfig, RawTrafficData, Resolution, TrafficData};
 use crate::netlink_client::NamespaceNetlinkClient;
 
 /// 10秒聚合间隔（单位：毫秒）
@@ -178,11 +178,11 @@ impl TrafficCollector {
                         };
                         let results = collect_namespace_round(&clients_snapshot).await;
 
-                        let mut raw_data: Vec<TrafficData> = Vec::new();
-                        let mut data_10s: Vec<TrafficData> = Vec::new();
-                        let mut data_1m: Vec<TrafficData> = Vec::new();
-                        let mut data_1h: Vec<TrafficData> = Vec::new();
-                        let mut data_1d: Vec<TrafficData> = Vec::new();
+                        let mut raw_data: Vec<RawTrafficData> = Vec::new();
+                        let mut data_10s: Vec<RawTrafficData> = Vec::new();
+                        let mut data_1m: Vec<RawTrafficData> = Vec::new();
+                        let mut data_1h: Vec<RawTrafficData> = Vec::new();
+                        let mut data_1d: Vec<RawTrafficData> = Vec::new();
                         let mut namespace_count = 0usize;
                         let mut failures = 0usize;
 
@@ -195,27 +195,28 @@ impl TrafficCollector {
                                     let mut states_guard = namespace_states.write().await;
                                     if let Some(state) = states_guard.get_mut(&namespace) {
                                         data.resolution = Some(Resolution::Realtime.as_str().to_string());
-                                        let _ = state.channels.realtime.send(data.clone());
+                                        // 发送时转换为 TrafficData（速度字段为 None）
+                                        let _ = state.channels.realtime.send(TrafficData::from(data.clone()));
 
                                         if should_aggregate(timestamp_ms, state.aggregation_state.last_10s_ts, INTERVAL_10S) {
                                             state.aggregation_state.last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
                                             data.resolution = Some(Resolution::TenSeconds.as_str().to_string());
                                             data_10s.push(data.clone());
-                                            let _ = state.channels.agg_10s.send(data.clone());
+                                            let _ = state.channels.agg_10s.send(TrafficData::from(data.clone()));
                                         }
 
                                         if should_aggregate(timestamp_ms, state.aggregation_state.last_1m_ts, INTERVAL_1M) {
                                             state.aggregation_state.last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
                                             data.resolution = Some(Resolution::OneMinute.as_str().to_string());
                                             data_1m.push(data.clone());
-                                            let _ = state.channels.agg_1m.send(data.clone());
+                                            let _ = state.channels.agg_1m.send(TrafficData::from(data.clone()));
                                         }
 
                                         if should_aggregate(timestamp_ms, state.aggregation_state.last_1h_ts, INTERVAL_1H) {
                                             state.aggregation_state.last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
                                             data.resolution = Some(Resolution::OneHour.as_str().to_string());
                                             data_1h.push(data.clone());
-                                            let _ = state.channels.agg_1h.send(data.clone());
+                                            let _ = state.channels.agg_1h.send(TrafficData::from(data.clone()));
                                         }
 
                                         if should_aggregate(timestamp_ms, state.aggregation_state.last_1d_ts, INTERVAL_1D) {
@@ -515,7 +516,7 @@ async fn shutdown_all_clients(states: &Arc<RwLock<HashMap<String, NamespaceState
 /// 返回每个命名空间的采集结果（命名空间名称，采集结果）
 async fn collect_namespace_round(
     client_snapshot: &[(String, Option<Arc<NamespaceNetlinkClient>>)],
-) -> Vec<(String, Result<TrafficData>)> {
+) -> Vec<(String, Result<RawTrafficData>)> {
     let mut results = Vec::with_capacity(client_snapshot.len());
     let semaphore = Arc::new(Semaphore::new(MAX_NAMESPACE_CONCURRENCY));
     let mut join_set = JoinSet::new();
@@ -573,7 +574,7 @@ async fn collect_namespace_round(
 async fn collect_namespace_data(
     namespace: &str,
     client: &NamespaceNetlinkClient,
-) -> Result<TrafficData> {
+) -> Result<RawTrafficData> {
     let timestamp = Utc::now();
     let interfaces = client.collect_interfaces().await.with_context(|| {
         format!(
@@ -582,7 +583,7 @@ async fn collect_namespace_data(
         )
     })?;
 
-    Ok(TrafficData {
+    Ok(RawTrafficData {
         namespace: namespace.to_string(),
         timestamp: timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
         timestamp_ms: timestamp.timestamp_millis(),

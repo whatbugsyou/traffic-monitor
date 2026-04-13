@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Context, Result};
-use crate::models::InterfaceStats;
+use crate::models::RawInterfaceStats;
+use anyhow::{anyhow, Result};
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -32,7 +32,12 @@ mod imp {
             let (connection, handle, _) = netns::run_in_namespace(&namespace, || {
                 new_connection().context("failed to create rtnetlink connection")
             })
-            .with_context(|| format!("failed to initialize netlink client in namespace {}", namespace))?;
+            .with_context(|| {
+                format!(
+                    "failed to initialize netlink client in namespace {}",
+                    namespace
+                )
+            })?;
 
             let closed = Arc::new(AtomicBool::new(false));
             let closed_for_task = Arc::clone(&closed);
@@ -56,7 +61,7 @@ mod imp {
             })
         }
 
-        pub async fn collect_interfaces(&self) -> Result<Vec<InterfaceStats>> {
+        pub async fn collect_interfaces(&self) -> Result<Vec<RawInterfaceStats>> {
             let _guard = self.collect_lock.lock().await;
 
             if self.is_closed() {
@@ -66,9 +71,12 @@ mod imp {
                 ));
             }
 
-            load_link_stats(self.handle.clone())
-                .await
-                .with_context(|| format!("failed to collect interface stats for namespace {}", self.namespace))
+            load_link_stats(self.handle.clone()).await.with_context(|| {
+                format!(
+                    "failed to collect interface stats for namespace {}",
+                    self.namespace
+                )
+            })
         }
 
         pub async fn shutdown(&self) -> Result<()> {
@@ -115,7 +123,7 @@ mod imp {
         }
     }
 
-    async fn load_link_stats(handle: Handle) -> Result<Vec<InterfaceStats>> {
+    async fn load_link_stats(handle: Handle) -> Result<Vec<RawInterfaceStats>> {
         let mut interfaces = Vec::new();
         let mut links = handle.link().get().execute();
 
@@ -133,13 +141,13 @@ mod imp {
         Ok(interfaces)
     }
 
-    fn interface_stats_from_link_message(message: LinkMessage) -> Option<InterfaceStats> {
+    fn interface_stats_from_link_message(message: LinkMessage) -> Option<RawInterfaceStats> {
         interface_stats_from_link_attributes(message.attributes)
     }
 
     fn interface_stats_from_link_attributes(
         attributes: Vec<LinkAttribute>,
-    ) -> Option<InterfaceStats> {
+    ) -> Option<RawInterfaceStats> {
         let mut interface_name: Option<String> = None;
         let mut stats64: Option<NetlinkInterfaceCounters> = None;
         let mut stats32: Option<NetlinkInterfaceCounters> = None;
@@ -160,7 +168,7 @@ mod imp {
         interface_name: Option<String>,
         stats64: Option<NetlinkInterfaceCounters>,
         stats32: Option<NetlinkInterfaceCounters>,
-    ) -> Option<InterfaceStats> {
+    ) -> Option<RawInterfaceStats> {
         let name = interface_name?;
         if name == "lo" {
             return None;
@@ -168,16 +176,12 @@ mod imp {
 
         let counters = stats64.or(stats32)?;
 
-        Some(InterfaceStats {
+        Some(RawInterfaceStats {
             name,
             rx_bytes: counters.rx_bytes,
             tx_bytes: counters.tx_bytes,
             rx_dropped: counters.rx_dropped,
             tx_dropped: counters.tx_dropped,
-            rx_speed: None,
-            tx_speed: None,
-            rx_dropped_speed: None,
-            tx_dropped_speed: None,
         })
     }
 
@@ -303,7 +307,7 @@ mod imp {
             ))
         }
 
-        pub async fn collect_interfaces(&self) -> Result<Vec<InterfaceStats>> {
+        pub async fn collect_interfaces(&self) -> Result<Vec<RawInterfaceStats>> {
             Err(anyhow!(
                 "long-lived rtnetlink collection is only supported on linux (namespace: {})",
                 self.namespace
