@@ -208,6 +208,9 @@ impl TrafficCollector {
         let (storage_tx, storage_rx) = mpsc::channel(STORAGE_CHANNEL_SIZE);
         let (broadcast_tx, broadcast_rx) = mpsc::channel(BROADCAST_CHANNEL_SIZE);
 
+        // 启动命名空间同步任务（独立运行，不阻塞采集）
+        let sync_task = self.spawn_namespace_sync_task();
+
         // 启动处理任务
         let processor_task = self.spawn_processor_task(collection_rx, storage_tx, broadcast_tx);
 
@@ -225,6 +228,7 @@ impl TrafficCollector {
         shutdown_rx.recv().await.ok();
 
         // 关闭所有任务
+        sync_task.abort();
         scheduler_task.abort();
         processor_task.abort();
         storage_task.abort();
@@ -234,6 +238,50 @@ impl TrafficCollector {
         shutdown_all_clients(&self.namespace_states).await;
 
         Ok(())
+    }
+
+    /// 启动命名空间同步任务（独立运行，不阻塞采集）
+    fn spawn_namespace_sync_task(&self) -> tokio::task::JoinHandle<()> {
+        let namespace_states = Arc::clone(&self.namespace_states);
+        let mut shutdown_rx = self.shutdown.subscribe();
+        /// 同步间隔（秒）
+        const SYNC_INTERVAL_SECS: u64 = 5;
+
+        tokio::spawn(async move {
+            let mut sync_interval = interval(Duration::from_secs(SYNC_INTERVAL_SECS));
+            sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            log::info!("Started namespace sync task");
+
+            loop {
+                tokio::select! {
+                    _ = sync_interval.tick() => {
+                        let sync_started_at = Instant::now();
+
+                        // 扫描命名空间
+                        let desired_namespaces: Vec<String> = match scan_namespaces() {
+                            Ok(namespaces) => namespaces,
+                            Err(error) => {
+                                log::error!("Failed to scan namespaces: {}", error);
+                                continue;
+                            }
+                        };
+
+                        // 同步命名空间状态
+                        synchronize_namespace_runtime_state(&namespace_states, &desired_namespaces).await;
+
+                        log::debug!(
+                            "Namespace sync finished in {} ms",
+                            sync_started_at.elapsed().as_millis()
+                        );
+                    }
+                    _ = shutdown_rx.recv() => {
+                        log::info!("Namespace sync task stopped");
+                        break;
+                    }
+                }
+            }
+        })
     }
 
     /// 启动调度任务
@@ -263,7 +311,7 @@ impl TrafficCollector {
                         let _guard = CollectionProgressGuard::new(Arc::clone(&collection_in_progress));
                         let round_started_at = Instant::now();
 
-                        // 执行采集轮次
+                        // 执行采集轮次（只获取快照，不等待同步）
                         Self::run_collection_round(
                             &namespace_states,
                             &collection_tx,
@@ -283,24 +331,12 @@ impl TrafficCollector {
         })
     }
 
-    /// 执行一轮采集
+    /// 执行一轮采集（只获取快照，不等待同步）
     async fn run_collection_round(
         namespace_states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
         collection_tx: &mpsc::Sender<CollectionMessage>,
     ) {
-        // 扫描命名空间
-        let desired_namespaces: Vec<String> = match scan_namespaces() {
-            Ok(namespaces) => namespaces,
-            Err(error) => {
-                log::error!("Failed to scan namespaces: {}", error);
-                namespace_states.read().await.keys().cloned().collect()
-            }
-        };
-
-        // 同步命名空间状态
-        synchronize_namespace_runtime_state(namespace_states, &desired_namespaces).await;
-
-        // 获取客户端快照
+        // 获取客户端快照（一次读锁，快速完成）
         let clients_snapshot: Vec<(String, Option<Arc<NamespaceNetlinkClient>>)> = {
             let states_guard = namespace_states.read().await;
             states_guard
