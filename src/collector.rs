@@ -523,6 +523,16 @@ impl TrafficCollector {
                     message.namespace,
                     error
                 );
+
+                // 清空客户端，下次扫描自动重建
+                let mut states_guard = namespace_states.write().await;
+                if let Some(state) = states_guard.get_mut(&message.namespace) {
+                    state.client = None;
+                    log::info!(
+                        "Cleared client for {} due to collection failure",
+                        message.namespace
+                    );
+                }
             }
         }
     }
@@ -739,9 +749,7 @@ async fn synchronize_namespace_runtime_state(
     // 检查需要创建/重建的客户端
     let to_create: Vec<String> = states_guard
         .iter()
-        .filter(|(_, state)| {
-            state.client.is_none() || state.client.as_ref().map_or(true, |c| c.is_closed())
-        })
+        .filter(|(_, state)| state.client.is_none())
         .map(|(ns, _)| ns.clone())
         .collect();
 
