@@ -40,10 +40,8 @@ async fn main() -> Result<()> {
             .context("Failed to create traffic collector")?,
     );
 
-    collector
-        .start()
-        .await
-        .context("Failed to start traffic collector")?;
+    // 启动采集器（所有后台任务在 tokio runtime 中并行运行）
+    collector.start().await;
     log::info!("Traffic collector started");
 
     log::info!("Starting HTTP server...");
@@ -68,11 +66,12 @@ async fn main() -> Result<()> {
         log::error!("HTTP server error: {}", e);
     }
 
+    // HTTP 服务器停止后，优雅关闭 collector（等待存储任务写入剩余数据）
     log::info!("Stopping traffic collector...");
-    if let Err(e) = collector.stop().await {
-        log::error!("Failed to stop collector: {}", e);
+    if let Err(e) = collector.shutdown().await {
+        log::error!("Failed to shutdown collector: {}", e);
     } else {
-        log::info!("Traffic collector stopped");
+        log::info!("Traffic collector stopped gracefully");
     }
 
     log::info!("All services stopped successfully");

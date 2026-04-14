@@ -4,13 +4,14 @@ use anyhow::{anyhow, Result};
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*;
+    use anyhow::Context;
     use futures_util::stream::TryStreamExt;
     use rtnetlink::{
         new_connection,
         packet_route::link::{LinkAttribute, LinkMessage, Stats, Stats64},
         Handle,
     };
-    use std::sync::Arc;
+
     use tokio::sync::Mutex;
 
     use crate::netns;
@@ -60,15 +61,6 @@ mod imp {
                     self.namespace
                 )
             })
-        }
-
-        pub async fn shutdown(&self) -> Result<()> {
-            // Connection task will automatically cleanup when handle is dropped
-            log::info!(
-                "Shutdown called for namespace {} (connection will close on drop)",
-                self.namespace
-            );
-            Ok(())
         }
 
         async fn load_link_stats(&self) -> Result<Vec<RawInterfaceStats>> {
@@ -261,10 +253,6 @@ mod imp {
                 "long-lived rtnetlink collection is only supported on linux (namespace: {})",
                 self.namespace
             ))
-        }
-
-        pub async fn shutdown(&self) -> Result<()> {
-            Ok(())
         }
     }
 }

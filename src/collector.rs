@@ -17,9 +17,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 
 use crate::database::Database;
 use crate::models::{CollectorConfig, RawTrafficData, Resolution, TrafficData};
@@ -174,80 +175,78 @@ pub struct TrafficCollector {
     namespace_states: Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
     /// 采集任务进行中标记
     collection_in_progress: Arc<AtomicBool>,
-    /// 关闭信号发送器
-    shutdown: broadcast::Sender<()>,
+    /// 任务取消令牌（Tokio 官方方案）
+    cancel_token: CancellationToken,
+    /// 后台任务集合（自动管理 JoinHandle）
+    tasks: Mutex<JoinSet<()>>,
+}
+
+impl Drop for TrafficCollector {
+    fn drop(&mut self) {
+        // 确保取消令牌被触发，防止任务泄漏
+        self.cancel_token.cancel();
+        log::info!("TrafficCollector dropping, cancellation token triggered");
+    }
 }
 
 impl TrafficCollector {
     pub fn new(db: Arc<Database>, config: CollectorConfig) -> Result<Self> {
-        let (shutdown, _) = broadcast::channel(1);
         let mut states = HashMap::new();
         states.insert("default".to_string(), NamespaceRuntimeState::new());
         let namespace_states = Arc::new(RwLock::new(states));
         let collection_in_progress = Arc::new(AtomicBool::new(false));
+        let cancel_token = CancellationToken::new();
+        let tasks = Mutex::new(JoinSet::new());
 
         Ok(TrafficCollector {
             db,
             config,
             namespace_states,
             collection_in_progress,
-            shutdown,
+            cancel_token,
+            tasks,
         })
     }
 
-    pub async fn start(&self) -> Result<()> {
-        self.start_collection_scheduler().await
-    }
-
-    /// 启动采集调度器
+    /// 启动采集器
     ///
-    /// 创建独立的处理任务和存储任务，通过 channel 解耦各层
-    async fn start_collection_scheduler(&self) -> Result<()> {
+    /// 创建独立的处理任务和存储任务，通过 channel 解耦各层。
+    /// 所有任务在 tokio runtime 中并行运行，此方法立即返回不阻塞。
+    pub async fn start(&self) {
         // 创建 channels
         let (collection_tx, collection_rx) = mpsc::channel(COLLECTION_CHANNEL_SIZE);
         let (storage_tx, storage_rx) = mpsc::channel(STORAGE_CHANNEL_SIZE);
         let (broadcast_tx, broadcast_rx) = mpsc::channel(BROADCAST_CHANNEL_SIZE);
 
+        // 获取 tasks mutex lock 并启动所有任务
+        let mut tasks = self.tasks.lock().await;
+
         // 启动命名空间同步任务（独立运行，不阻塞采集）
-        let sync_task = self.spawn_namespace_sync_task();
+        tasks.spawn(self.spawn_namespace_sync_task());
 
         // 启动处理任务
-        let processor_task = self.spawn_processor_task(collection_rx, storage_tx, broadcast_tx);
+        tasks.spawn(self.spawn_processor_task(collection_rx, storage_tx, broadcast_tx));
 
         // 启动存储任务
-        let storage_task = self.spawn_storage_task(storage_rx);
+        tasks.spawn(self.spawn_storage_task(storage_rx));
 
         // 启动广播任务
-        let broadcaster_task = self.spawn_broadcaster_task(broadcast_rx);
+        tasks.spawn(self.spawn_broadcaster_task(broadcast_rx));
 
         // 启动调度任务
-        let scheduler_task = self.spawn_scheduler_task(collection_tx);
+        tasks.spawn(self.spawn_scheduler_task(collection_tx));
 
-        // 等待关闭信号
-        let mut shutdown_rx = self.shutdown.subscribe();
-        shutdown_rx.recv().await.ok();
-
-        // 关闭所有任务
-        sync_task.abort();
-        scheduler_task.abort();
-        processor_task.abort();
-        storage_task.abort();
-        broadcaster_task.abort();
-
-        // 关闭所有客户端
-        shutdown_all_clients(&self.namespace_states).await;
-
-        Ok(())
+        log::info!("All collection tasks spawned and running in background");
     }
 
     /// 启动命名空间同步任务（独立运行，不阻塞采集）
-    fn spawn_namespace_sync_task(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_namespace_sync_task(&self) -> impl std::future::Future<Output = ()> {
         let namespace_states = Arc::clone(&self.namespace_states);
-        let mut shutdown_rx = self.shutdown.subscribe();
+        let cancel_token = self.cancel_token.clone();
         /// 同步间隔（秒）
         const SYNC_INTERVAL_SECS: u64 = 5;
 
-        tokio::spawn(async move {
+        async move {
             let mut sync_interval = interval(Duration::from_secs(SYNC_INTERVAL_SECS));
             sync_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -275,26 +274,26 @@ impl TrafficCollector {
                             sync_started_at.elapsed().as_millis()
                         );
                     }
-                    _ = shutdown_rx.recv() => {
+                    _ = cancel_token.cancelled() => {
                         log::info!("Namespace sync task stopped");
                         break;
                     }
                 }
             }
-        })
+        }
     }
 
     /// 启动调度任务
     fn spawn_scheduler_task(
         &self,
         collection_tx: mpsc::Sender<CollectionMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> impl std::future::Future<Output = ()> {
         let namespace_states = Arc::clone(&self.namespace_states);
         let collection_in_progress = Arc::clone(&self.collection_in_progress);
         let config = self.config.clone();
-        let mut shutdown_rx = self.shutdown.subscribe();
+        let cancel_token = self.cancel_token.clone();
 
-        tokio::spawn(async move {
+        async move {
             let mut collect_interval = interval(Duration::from_secs(config.interval_secs));
             collect_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -322,13 +321,13 @@ impl TrafficCollector {
                             round_started_at.elapsed().as_millis()
                         );
                     }
-                    _ = shutdown_rx.recv() => {
+                    _ = cancel_token.cancelled() => {
                         log::info!("Collection scheduler stopped");
                         break;
                     }
                 }
             }
-        })
+        }
     }
 
     /// 执行一轮采集（只获取快照，不等待同步）
@@ -389,11 +388,11 @@ impl TrafficCollector {
         collection_rx: mpsc::Receiver<CollectionMessage>,
         storage_tx: mpsc::Sender<StorageMessage>,
         broadcast_tx: mpsc::Sender<BroadcastMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> impl std::future::Future<Output = ()> {
         let namespace_states = Arc::clone(&self.namespace_states);
-        let mut shutdown_rx = self.shutdown.subscribe();
+        let cancel_token = self.cancel_token.clone();
 
-        tokio::spawn(async move {
+        async move {
             log::info!("Started data processor");
 
             let mut collection_rx = collection_rx;
@@ -413,7 +412,7 @@ impl TrafficCollector {
                             &mut failure_count,
                         ).await;
                     }
-                    _ = shutdown_rx.recv() => {
+                    _ = cancel_token.cancelled() => {
                         log::info!(
                             "Data processor stopped (total: {} success, {} failed)",
                             success_count,
@@ -423,7 +422,7 @@ impl TrafficCollector {
                     }
                 }
             }
-        })
+        }
     }
 
     /// 处理单个采集消息，立即发送到存储层
@@ -541,11 +540,11 @@ impl TrafficCollector {
     fn spawn_storage_task(
         &self,
         storage_rx: mpsc::Receiver<StorageMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> impl std::future::Future<Output = ()> {
         let db = Arc::clone(&self.db);
-        let mut shutdown_rx = self.shutdown.subscribe();
+        let cancel_token = self.cancel_token.clone();
 
-        tokio::spawn(async move {
+        async move {
             log::info!("Started data storage");
 
             let mut storage_rx = storage_rx;
@@ -608,7 +607,7 @@ impl TrafficCollector {
                         data_1h_buffer.clear();
                         data_1d_buffer.clear();
                     }
-                    _ = shutdown_rx.recv() => {
+                    _ = cancel_token.cancelled() => {
                         // 关闭前写入剩余数据
                         if !realtime_buffer.is_empty() {
                             if let Err(error) = db.insert_round_batch(
@@ -626,18 +625,18 @@ impl TrafficCollector {
                     }
                 }
             }
-        })
+        }
     }
 
     /// 启动广播任务
     fn spawn_broadcaster_task(
         &self,
         broadcast_rx: mpsc::Receiver<BroadcastMessage>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> impl std::future::Future<Output = ()> {
         let _namespace_states = Arc::clone(&self.namespace_states);
-        let mut shutdown_rx = self.shutdown.subscribe();
+        let cancel_token = self.cancel_token.clone();
 
-        tokio::spawn(async move {
+        async move {
             log::info!("Started broadcaster");
 
             let mut broadcast_rx = broadcast_rx;
@@ -653,13 +652,13 @@ impl TrafficCollector {
                             message.namespace
                         );
                     }
-                    _ = shutdown_rx.recv() => {
+                    _ = cancel_token.cancelled() => {
                         log::info!("Broadcaster stopped");
                         break;
                     }
                 }
             }
-        })
+        }
     }
 
     /// 订阅指定命名空间和分辨率的数据
@@ -679,9 +678,27 @@ impl TrafficCollector {
         self.namespace_states.read().await.keys().cloned().collect()
     }
 
-    /// 停止采集器
-    pub async fn stop(&self) -> Result<()> {
-        let _ = self.shutdown.send(());
+    /// 停止采集器，等待所有任务完成清理
+    ///
+    /// 这是优雅关闭的正确方式：
+    /// 1. 触发取消令牌，所有任务收到信号
+    /// 2. 等待所有任务完成（特别是存储任务写入剩余数据）
+    /// 3. 确保没有数据丢失
+    pub async fn shutdown(&self) -> Result<()> {
+        log::info!("Initiating graceful shutdown...");
+
+        // 1. 触发取消令牌，所有任务开始退出
+        self.cancel_token.cancel();
+
+        // 2. 等待所有任务完成清理
+        let mut tasks = self.tasks.lock().await;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result {
+                log::error!("Task panicked during shutdown: {}", e);
+            }
+        }
+
+        log::info!("All background tasks stopped gracefully");
         Ok(())
     }
 }
@@ -726,16 +743,9 @@ async fn synchronize_namespace_runtime_state(
         .collect();
 
     for namespace in to_remove {
-        let namespace_log = namespace.clone();
-        if let Some(state) = states_guard.remove(&namespace) {
-            if let Some(client) = state.client {
-                tokio::spawn(async move {
-                    if let Err(e) = client.shutdown().await {
-                        log::error!("Failed to shutdown client for {}: {}", namespace, e);
-                    }
-                });
-            }
-            log::info!("Removed namespace: {}", namespace_log);
+        if let Some(_state) = states_guard.remove(&namespace) {
+            // state.client 会在这里被自动 drop，RAII 机制会清理资源
+            log::info!("Removed namespace: {}", namespace);
         }
     }
 
@@ -774,21 +784,12 @@ async fn synchronize_namespace_runtime_state(
 
 /// 关闭所有客户端
 async fn shutdown_all_clients(states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>) {
-    let clients: Vec<(String, Arc<NamespaceNetlinkClient>)> = {
-        let mut states_guard = states.write().await;
-        states_guard
-            .iter_mut()
-            .filter_map(|(ns, state)| state.client.take().map(|c| (ns.clone(), c)))
-            .collect()
-    };
-
-    for (namespace, client) in clients {
-        if let Err(error) = client.shutdown().await {
-            log::error!("Failed to shutdown client for {}: {}", namespace, error);
-        } else {
-            log::info!("Shutdown client for namespace: {}", namespace);
-        }
-    }
+    let mut states_guard = states.write().await;
+    let count = states_guard
+        .iter_mut()
+        .filter_map(|(_, state)| state.client.take())
+        .count();
+    log::info!("Cleared {} namespace clients (RAII cleanup)", count);
 }
 
 /// 采集单个命名空间的数据
