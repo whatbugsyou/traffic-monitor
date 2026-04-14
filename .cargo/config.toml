@@ -16,3 +16,7 @@ jobs = 8
 #
 # [source.rsproxy]
 # registry = "https://rsproxy.cn/crates.io-index"
+
+# musl 交叉编译配置
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
