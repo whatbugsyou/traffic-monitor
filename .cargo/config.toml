@@ -12,7 +12,7 @@ jobs = 8
 
 # musl 静态链接配置
 [target.x86_64-unknown-linux-musl]
-linker = "musl-gcc"
+linker = "x86_64-linux-musl-gcc"
 
 # 如果官方源无法访问，可以尝试以下镜像源（取消注释）：
 # [source.crates-io]
