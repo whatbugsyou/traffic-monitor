@@ -10,12 +10,8 @@ mod imp {
         packet_route::link::{LinkAttribute, LinkMessage, Stats, Stats64},
         Handle,
     };
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex,
-    };
+    use std::sync::Arc;
     use tokio::sync::Mutex;
-    use tokio::task::JoinHandle;
 
     use crate::netns;
 
@@ -23,8 +19,6 @@ mod imp {
         namespace: String,
         handle: Handle,
         collect_lock: Mutex<()>,
-        connection_task: StdMutex<Option<JoinHandle<()>>>,
-        closed: Arc<AtomicBool>,
     }
 
     impl NamespaceNetlinkClient {
@@ -39,13 +33,11 @@ mod imp {
                 )
             })?;
 
-            let closed = Arc::new(AtomicBool::new(false));
-            let closed_for_task = Arc::clone(&closed);
             let namespace_for_task = namespace.clone();
 
-            let connection_task = tokio::spawn(async move {
+            // Fire-and-forget: Connection runs in background
+            tokio::spawn(async move {
                 connection.await;
-                closed_for_task.store(true, Ordering::Release);
                 log::warn!(
                     "Long-lived rtnetlink connection task exited for namespace {}",
                     namespace_for_task
@@ -56,20 +48,11 @@ mod imp {
                 namespace,
                 handle,
                 collect_lock: Mutex::new(()),
-                connection_task: StdMutex::new(Some(connection_task)),
-                closed,
             })
         }
 
         pub async fn collect_interfaces(&self) -> Result<Vec<RawInterfaceStats>> {
             let _guard = self.collect_lock.lock().await;
-
-            if self.is_closed() {
-                return Err(anyhow!(
-                    "netlink client is closed for namespace {}",
-                    self.namespace
-                ));
-            }
 
             self.load_link_stats().await.with_context(|| {
                 format!(
@@ -80,65 +63,31 @@ mod imp {
         }
 
         pub async fn shutdown(&self) -> Result<()> {
-            let join_handle = {
-                let mut guard = self
-                    .connection_task
-                    .lock()
-                    .map_err(|_| anyhow!("netlink client connection task mutex poisoned"))?;
-                guard.take()
-            };
-
-            self.closed.store(true, Ordering::Release);
-
-            if let Some(join_handle) = join_handle {
-                join_handle.abort();
-                match join_handle.await {
-                    Ok(()) => {}
-                    Err(error) if error.is_cancelled() => {}
-                    Err(error) => {
-                        return Err(anyhow!(
-                            "failed to stop rtnetlink connection task for namespace {}: {}",
-                            self.namespace,
-                            error
-                        ));
-                    }
-                }
-            }
-
+            // Connection task will automatically cleanup when handle is dropped
+            log::info!(
+                "Shutdown called for namespace {} (connection will close on drop)",
+                self.namespace
+            );
             Ok(())
         }
 
-        pub fn is_closed(&self) -> bool {
-            if self.closed.load(Ordering::Acquire) {
-                return true;
+        async fn load_link_stats(&self) -> Result<Vec<RawInterfaceStats>> {
+            let mut interfaces = Vec::new();
+            let mut links = self.handle.link().get().execute();
+
+            while let Some(message) = links
+                .try_next()
+                .await
+                .context("failed to receive rtnetlink link message")?
+            {
+                if let Some(interface) = interface_stats_from_link_message(message) {
+                    interfaces.push(interface);
+                }
             }
 
-            match self.connection_task.lock() {
-                Ok(guard) => match guard.as_ref() {
-                    Some(handle) => handle.is_finished(),
-                    None => true,
-                },
-                Err(_) => true,
-            }
+            interfaces.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(interfaces)
         }
-    }
-
-    async fn load_link_stats(&self) -> Result<Vec<RawInterfaceStats>> {
-        let mut interfaces = Vec::new();
-        let mut links = self.handle.link().get().execute();
-
-        while let Some(message) = links
-            .try_next()
-            .await
-            .context("failed to receive rtnetlink link message")?
-        {
-            if let Some(interface) = interface_stats_from_link_message(message) {
-                interfaces.push(interface);
-            }
-        }
-
-        interfaces.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(interfaces)
     }
 
     fn interface_stats_from_link_message(message: LinkMessage) -> Option<RawInterfaceStats> {
@@ -316,10 +265,6 @@ mod imp {
 
         pub async fn shutdown(&self) -> Result<()> {
             Ok(())
-        }
-
-        pub fn is_closed(&self) -> bool {
-            true
         }
     }
 }
