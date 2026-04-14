@@ -71,7 +71,7 @@ mod imp {
                 ));
             }
 
-            load_link_stats(self.handle.clone()).await.with_context(|| {
+            self.load_link_stats().await.with_context(|| {
                 format!(
                     "failed to collect interface stats for namespace {}",
                     self.namespace
@@ -123,9 +123,9 @@ mod imp {
         }
     }
 
-    async fn load_link_stats(handle: Handle) -> Result<Vec<RawInterfaceStats>> {
+    async fn load_link_stats(&self) -> Result<Vec<RawInterfaceStats>> {
         let mut interfaces = Vec::new();
-        let mut links = handle.link().get().execute();
+        let mut links = self.handle.link().get().execute();
 
         while let Some(message) = links
             .try_next()
