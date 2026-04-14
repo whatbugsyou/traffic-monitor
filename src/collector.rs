@@ -1,23 +1,33 @@
 //! 流量采集器核心模块
 //!
 //! 本模块负责从 Linux 网络命名空间中采集网络流量数据，
-//! 支持多分辨率聚合（实时、10秒、1分钟、1小时）并通过广播通道分发数据。
+//! 采用职责分离架构：采集层、处理层、存储层、广播层独立运行。
+//!
+//! 数据流：
+//! Scheduler ─► Collector ─► mpsc ─► Processor ─► mpsc ─► Storage
+//!                                      │
+//!                                      ▼
+//!                               Broadcaster ─► 前端
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::database::Database;
 use crate::models::{CollectorConfig, RawTrafficData, Resolution, TrafficData};
 use crate::netlink_client::NamespaceNetlinkClient;
+
+// ============================================================================
+// 常量定义
+// ============================================================================
 
 /// 10秒聚合间隔（单位：毫秒）
 const INTERVAL_10S: i64 = 10_000;
@@ -29,11 +39,40 @@ const INTERVAL_1H: i64 = 3_600_000;
 const INTERVAL_1D: i64 = 86_400_000;
 /// 命名空间并发采集上限
 const MAX_NAMESPACE_CONCURRENCY: usize = 20;
+/// 采集结果 channel 缓冲区大小
+const COLLECTION_CHANNEL_SIZE: usize = 100;
+/// 存储请求 channel 缓冲区大小
+const STORAGE_CHANNEL_SIZE: usize = 100;
+/// 广播通道缓冲区大小
+const BROADCAST_CHANNEL_SIZE: usize = 100;
+
+// ============================================================================
+// 数据结构定义
+// ============================================================================
+
+/// 采集结果消息（采集层 → 处理层）
+struct CollectionMessage {
+    namespace: String,
+    result: Result<RawTrafficData>,
+}
+
+/// 存储请求消息（处理层 → 存储层）
+struct StorageMessage {
+    data: RawTrafficData,
+    resolutions: Vec<Resolution>,
+    /// 1天聚合数据（单独处理，不需要广播）
+    data_1d: Option<RawTrafficData>,
+}
+
+/// 广播请求消息（处理层 → 广播层）
+struct BroadcastMessage {
+    namespace: String,
+    data: TrafficData,
+    resolution: Resolution,
+}
 
 /// 管理不同分辨率的广播通道
-///
-/// 包含实时数据和各聚合级别（10秒、1分钟、1小时）的数据通道，
-/// 用于向订阅者分发流量数据。
+#[derive(Clone)]
 struct ResolutionChannels {
     realtime: broadcast::Sender<TrafficData>,
     agg_10s: broadcast::Sender<TrafficData>,
@@ -43,10 +82,10 @@ struct ResolutionChannels {
 
 impl ResolutionChannels {
     fn new() -> Self {
-        let (realtime, _) = broadcast::channel(100);
-        let (agg_10s, _) = broadcast::channel(100);
-        let (agg_1m, _) = broadcast::channel(100);
-        let (agg_1h, _) = broadcast::channel(100);
+        let (realtime, _) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
+        let (agg_10s, _) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
+        let (agg_1m, _) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
+        let (agg_1h, _) = broadcast::channel(BROADCAST_CHANNEL_SIZE);
 
         ResolutionChannels {
             realtime,
@@ -70,19 +109,26 @@ impl ResolutionChannels {
     }
 }
 
-/// 单个命名空间的完整运行时状态
-///
-/// 封装单个命名空间的所有相关状态，确保数据局部性和操作原子性。
-struct NamespaceState {
+/// 单个命名空间的聚合状态
+#[derive(Debug, Default, Clone)]
+struct NamespaceAggregationState {
+    last_10s_ts: Option<i64>,
+    last_1m_ts: Option<i64>,
+    last_1h_ts: Option<i64>,
+    last_1d_ts: Option<i64>,
+}
+
+/// 单个命名空间的运行时状态
+struct NamespaceRuntimeState {
     /// 广播通道
     channels: ResolutionChannels,
     /// 聚合状态
     aggregation_state: NamespaceAggregationState,
-    /// netlink 客户端（可选，延迟初始化）
+    /// netlink 客户端
     client: Option<Arc<NamespaceNetlinkClient>>,
 }
 
-impl NamespaceState {
+impl NamespaceRuntimeState {
     fn new() -> Self {
         Self {
             channels: ResolutionChannels::new(),
@@ -92,21 +138,40 @@ impl NamespaceState {
     }
 }
 
+/// 采集进度守卫（RAII模式）
+struct CollectionProgressGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl CollectionProgressGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+}
+
+impl Drop for CollectionProgressGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+// ============================================================================
+// 主采集器
+// ============================================================================
+
 /// 主采集器结构体
 ///
-/// 负责协调网络命名空间的流量采集工作，包括：
-/// - 扫描和管理命名空间
-/// - 维护 netlink 客户端连接
-/// - 执行数据采集和聚合
-/// - 通过广播通道分发数据
-/// - 持久化数据到数据库
+/// 协调各层工作：
+/// - 调度层：定时触发采集
+/// - 采集层：并发采集原始数据
+/// - 处理层：聚合计算和分发
+/// - 存储层：异步写入数据库
+/// - 广播层：发送数据到前端
 pub struct TrafficCollector {
-    /// 数据库连接
     db: Arc<Database>,
-    /// 采集器配置
     config: CollectorConfig,
-    /// 命名空间状态映射
-    namespace_states: Arc<RwLock<HashMap<String, NamespaceState>>>,
+    /// 命名空间运行时状态（独立锁）
+    namespace_states: Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
     /// 采集任务进行中标记
     collection_in_progress: Arc<AtomicBool>,
     /// 关闭信号发送器
@@ -117,8 +182,7 @@ impl TrafficCollector {
     pub fn new(db: Arc<Database>, config: CollectorConfig) -> Result<Self> {
         let (shutdown, _) = broadcast::channel(1);
         let mut states = HashMap::new();
-        // 初始化默认命名空间
-        states.insert("default".to_string(), NamespaceState::new());
+        states.insert("default".to_string(), NamespaceRuntimeState::new());
         let namespace_states = Arc::new(RwLock::new(states));
         let collection_in_progress = Arc::new(AtomicBool::new(false));
 
@@ -135,12 +199,52 @@ impl TrafficCollector {
         self.start_collection_scheduler().await
     }
 
+    /// 启动采集调度器
+    ///
+    /// 创建独立的处理任务和存储任务，通过 channel 解耦各层
     async fn start_collection_scheduler(&self) -> Result<()> {
-        let db = Arc::clone(&self.db);
+        // 创建 channels
+        let (collection_tx, collection_rx) = mpsc::channel(COLLECTION_CHANNEL_SIZE);
+        let (storage_tx, storage_rx) = mpsc::channel(STORAGE_CHANNEL_SIZE);
+        let (broadcast_tx, broadcast_rx) = mpsc::channel(BROADCAST_CHANNEL_SIZE);
+
+        // 启动处理任务
+        let processor_task = self.spawn_processor_task(collection_rx, storage_tx, broadcast_tx);
+
+        // 启动存储任务
+        let storage_task = self.spawn_storage_task(storage_rx);
+
+        // 启动广播任务
+        let broadcaster_task = self.spawn_broadcaster_task(broadcast_rx);
+
+        // 启动调度任务
+        let scheduler_task = self.spawn_scheduler_task(collection_tx);
+
+        // 等待关闭信号
+        let mut shutdown_rx = self.shutdown.subscribe();
+        shutdown_rx.recv().await.ok();
+
+        // 关闭所有任务
+        scheduler_task.abort();
+        processor_task.abort();
+        storage_task.abort();
+        broadcaster_task.abort();
+
+        // 关闭所有客户端
+        shutdown_all_clients(&self.namespace_states).await;
+
+        Ok(())
+    }
+
+    /// 启动调度任务
+    fn spawn_scheduler_task(
+        &self,
+        collection_tx: mpsc::Sender<CollectionMessage>,
+    ) -> tokio::task::JoinHandle<()> {
         let namespace_states = Arc::clone(&self.namespace_states);
         let collection_in_progress = Arc::clone(&self.collection_in_progress);
-        let mut shutdown_rx = self.shutdown.subscribe();
         let config = self.config.clone();
+        let mut shutdown_rx = self.shutdown.subscribe();
 
         tokio::spawn(async move {
             let mut collect_interval = interval(Duration::from_secs(config.interval_secs));
@@ -156,197 +260,397 @@ impl TrafficCollector {
                             continue;
                         }
 
-                        let _collection_guard = CollectionProgressGuard::new(Arc::clone(&collection_in_progress));
+                        let _guard = CollectionProgressGuard::new(Arc::clone(&collection_in_progress));
                         let round_started_at = Instant::now();
 
-                        let desired_namespaces: Vec<String> = match scan_namespaces() {
-                            Ok(namespaces_from_scan) => namespaces_from_scan,
-                            Err(error) => {
-                                log::error!("Failed to scan namespaces for this tick: {}", error);
-                                namespace_states.read().await.keys().cloned().collect()
-                            }
-                        };
+                        // 执行采集轮次
+                        Self::run_collection_round(
+                            &namespace_states,
+                            &collection_tx,
+                        ).await;
 
-                        synchronize_namespace_runtime_state(&namespace_states, &desired_namespaces).await;
-
-                        let clients_snapshot: Vec<(String, Option<Arc<NamespaceNetlinkClient>>)> = {
-                            let states_guard = namespace_states.read().await;
-                            states_guard
-                                .iter()
-                                .map(|(namespace, state)| (namespace.clone(), state.client.clone()))
-                                .collect()
-                        };
-                        let results = collect_namespace_round(&clients_snapshot).await;
-
-                        let mut raw_data: Vec<RawTrafficData> = Vec::new();
-                        let mut data_10s: Vec<RawTrafficData> = Vec::new();
-                        let mut data_1m: Vec<RawTrafficData> = Vec::new();
-                        let mut data_1h: Vec<RawTrafficData> = Vec::new();
-                        let mut data_1d: Vec<RawTrafficData> = Vec::new();
-                        let mut namespace_count = 0usize;
-                        let mut failures = 0usize;
-
-                        for (namespace, result) in results {
-                            match result {
-                                Ok(mut data) => {
-                                    namespace_count += 1;
-                                    let timestamp_ms = data.timestamp_ms;
-
-                                    let mut states_guard = namespace_states.write().await;
-                                    if let Some(state) = states_guard.get_mut(&namespace) {
-                                        data.resolution = Some(Resolution::Realtime.as_str().to_string());
-                                        // 发送时转换为 TrafficData（速度字段为 None）
-                                        let _ = state.channels.realtime.send(TrafficData::from(data.clone()));
-
-                                        if should_aggregate(timestamp_ms, state.aggregation_state.last_10s_ts, INTERVAL_10S) {
-                                            state.aggregation_state.last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
-                                            data.resolution = Some(Resolution::TenSeconds.as_str().to_string());
-                                            data_10s.push(data.clone());
-                                            let _ = state.channels.agg_10s.send(TrafficData::from(data.clone()));
-                                        }
-
-                                        if should_aggregate(timestamp_ms, state.aggregation_state.last_1m_ts, INTERVAL_1M) {
-                                            state.aggregation_state.last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
-                                            data.resolution = Some(Resolution::OneMinute.as_str().to_string());
-                                            data_1m.push(data.clone());
-                                            let _ = state.channels.agg_1m.send(TrafficData::from(data.clone()));
-                                        }
-
-                                        if should_aggregate(timestamp_ms, state.aggregation_state.last_1h_ts, INTERVAL_1H) {
-                                            state.aggregation_state.last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
-                                            data.resolution = Some(Resolution::OneHour.as_str().to_string());
-                                            data_1h.push(data.clone());
-                                            let _ = state.channels.agg_1h.send(TrafficData::from(data.clone()));
-                                        }
-
-                                        if should_aggregate(timestamp_ms, state.aggregation_state.last_1d_ts, INTERVAL_1D) {
-                                            state.aggregation_state.last_1d_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1D));
-                                            data_1d.push(data.clone());
-                                        }
-
-                                        raw_data.push(data);
-                                    }
-                                }
-                                Err(error) => {
-                                    failures += 1;
-                                    log::error!("Failed to collect data for {}: {}", namespace, error);
-                                }
-                            }
-                        }
-
-                        if let Err(error) = db.insert_round_batch(
-                            &raw_data,
-                            &data_10s,
-                            &data_1m,
-                            &data_1h,
-                            &data_1d,
-                        ) {
-                            log::error!("Failed to store round batch data: {}", error);
-                        }
-
-                        log::info!(
-                            "Collection round finished in {} ms for {} namespaces ({} failures)",
-                            round_started_at.elapsed().as_millis(),
-                            namespace_count,
-                            failures
+                        log::debug!(
+                            "Collection round scheduling finished in {} ms",
+                            round_started_at.elapsed().as_millis()
                         );
                     }
                     _ = shutdown_rx.recv() => {
                         log::info!("Collection scheduler stopped");
-                        shutdown_all_clients(&namespace_states).await;
                         break;
                     }
                 }
             }
-        });
-
-        Ok(())
+        })
     }
 
+    /// 执行一轮采集
+    async fn run_collection_round(
+        namespace_states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
+        collection_tx: &mpsc::Sender<CollectionMessage>,
+    ) {
+        // 扫描命名空间
+        let desired_namespaces: Vec<String> = match scan_namespaces() {
+            Ok(namespaces) => namespaces,
+            Err(error) => {
+                log::error!("Failed to scan namespaces: {}", error);
+                namespace_states.read().await.keys().cloned().collect()
+            }
+        };
+
+        // 同步命名空间状态
+        synchronize_namespace_runtime_state(namespace_states, &desired_namespaces).await;
+
+        // 获取客户端快照
+        let clients_snapshot: Vec<(String, Option<Arc<NamespaceNetlinkClient>>)> = {
+            let states_guard = namespace_states.read().await;
+            states_guard
+                .iter()
+                .map(|(namespace, state)| (namespace.clone(), state.client.clone()))
+                .collect()
+        };
+
+        // 并发采集
+        let semaphore = Arc::new(Semaphore::new(MAX_NAMESPACE_CONCURRENCY));
+        let mut join_set = JoinSet::new();
+
+        for (namespace, client) in clients_snapshot {
+            let semaphore = Arc::clone(&semaphore);
+            let collection_tx = collection_tx.clone();
+
+            join_set.spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("collection semaphore closed unexpectedly");
+
+                let result = match client {
+                    Some(client) => collect_namespace_data(&namespace, &client).await,
+                    None => Err(anyhow!("no netlink client for namespace {}", namespace)),
+                };
+
+                // 发送采集结果到处理层
+                if collection_tx
+                    .send(CollectionMessage { namespace, result })
+                    .await
+                    .is_err()
+                {
+                    log::warn!("Collection channel closed, dropping result");
+                }
+            });
+        }
+
+        // 等待所有采集任务完成
+        while let Some(result) = join_set.join_next().await {
+            if let Err(error) = result {
+                log::error!("Collection task panicked: {}", error);
+            }
+        }
+    }
+
+    /// 启动处理任务
+    fn spawn_processor_task(
+        &self,
+        collection_rx: mpsc::Receiver<CollectionMessage>,
+        storage_tx: mpsc::Sender<StorageMessage>,
+        broadcast_tx: mpsc::Sender<BroadcastMessage>,
+    ) -> tokio::task::JoinHandle<()> {
+        let namespace_states = Arc::clone(&self.namespace_states);
+        let mut shutdown_rx = self.shutdown.subscribe();
+
+        tokio::spawn(async move {
+            log::info!("Started data processor");
+
+            let mut collection_rx = collection_rx;
+            let mut success_count = 0usize;
+            let mut failure_count = 0usize;
+
+            loop {
+                tokio::select! {
+                    // 接收采集结果，立即处理并发送
+                    Some(message) = collection_rx.recv() => {
+                        Self::process_collection_message(
+                            &namespace_states,
+                            message,
+                            &storage_tx,
+                            &broadcast_tx,
+                            &mut success_count,
+                            &mut failure_count,
+                        ).await;
+                    }
+                    _ = shutdown_rx.recv() => {
+                        log::info!(
+                            "Data processor stopped (total: {} success, {} failed)",
+                            success_count,
+                            failure_count
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// 处理单个采集消息，立即发送到存储层
+    async fn process_collection_message(
+        namespace_states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
+        message: CollectionMessage,
+        storage_tx: &mpsc::Sender<StorageMessage>,
+        broadcast_tx: &mpsc::Sender<BroadcastMessage>,
+        success_count: &mut usize,
+        failure_count: &mut usize,
+    ) {
+        match message.result {
+            Ok(data) => {
+                *success_count += 1;
+                let timestamp_ms = data.timestamp_ms;
+
+                // 获取命名空间状态（独立锁）
+                let (channels, agg_state) = {
+                    let states_guard = namespace_states.read().await;
+                    if let Some(state) = states_guard.get(&message.namespace) {
+                        (state.channels.clone(), state.aggregation_state.clone())
+                    } else {
+                        log::warn!("Namespace {} not found in states", message.namespace);
+                        return;
+                    }
+                };
+
+                // 发送实时广播（在锁外）
+                let realtime_traffic = TrafficData::from(data.clone());
+                let _ = channels.realtime.send(realtime_traffic.clone());
+
+                // 发送广播消息
+                let _ = broadcast_tx
+                    .send(BroadcastMessage {
+                        namespace: message.namespace.clone(),
+                        data: realtime_traffic,
+                        resolution: Resolution::Realtime,
+                    })
+                    .await;
+
+                // 计算聚合（无锁操作）
+                let mut new_agg_state = agg_state.clone();
+                let mut resolutions_to_store = vec![Resolution::Realtime];
+
+                if should_aggregate(timestamp_ms, agg_state.last_10s_ts, INTERVAL_10S) {
+                    new_agg_state.last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
+                    resolutions_to_store.push(Resolution::TenSeconds);
+                    let _ = channels.agg_10s.send(TrafficData::from(data.clone()));
+                }
+
+                if should_aggregate(timestamp_ms, agg_state.last_1m_ts, INTERVAL_1M) {
+                    new_agg_state.last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
+                    resolutions_to_store.push(Resolution::OneMinute);
+                    let _ = channels.agg_1m.send(TrafficData::from(data.clone()));
+                }
+
+                if should_aggregate(timestamp_ms, agg_state.last_1h_ts, INTERVAL_1H) {
+                    new_agg_state.last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
+                    resolutions_to_store.push(Resolution::OneHour);
+                    let _ = channels.agg_1h.send(TrafficData::from(data.clone()));
+                }
+
+                // 1天聚合数据单独处理（不需要广播）
+                let data_1d_to_store =
+                    if should_aggregate(timestamp_ms, agg_state.last_1d_ts, INTERVAL_1D) {
+                        new_agg_state.last_1d_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1D));
+                        Some(data.clone())
+                    } else {
+                        None
+                    };
+
+                // 更新聚合状态
+                {
+                    let mut states_guard = namespace_states.write().await;
+                    if let Some(state) = states_guard.get_mut(&message.namespace) {
+                        state.aggregation_state = new_agg_state;
+                    }
+                }
+
+                // 立即发送到存储层
+                if storage_tx
+                    .send(StorageMessage {
+                        data,
+                        resolutions: resolutions_to_store,
+                        data_1d: data_1d_to_store,
+                    })
+                    .await
+                    .is_err()
+                {
+                    log::warn!("Storage channel closed");
+                }
+            }
+            Err(error) => {
+                *failure_count += 1;
+                log::error!(
+                    "Failed to collect data for {}: {}",
+                    message.namespace,
+                    error
+                );
+            }
+        }
+    }
+
+    /// 启动存储任务（接收单个数据，批量写入）
+    fn spawn_storage_task(
+        &self,
+        storage_rx: mpsc::Receiver<StorageMessage>,
+    ) -> tokio::task::JoinHandle<()> {
+        let db = Arc::clone(&self.db);
+        let mut shutdown_rx = self.shutdown.subscribe();
+
+        tokio::spawn(async move {
+            log::info!("Started data storage");
+
+            let mut storage_rx = storage_rx;
+            let mut realtime_buffer = Vec::new();
+            let mut data_10s_buffer = Vec::new();
+            let mut data_1m_buffer = Vec::new();
+            let mut data_1h_buffer = Vec::new();
+            let mut data_1d_buffer = Vec::new();
+            const FLUSH_INTERVAL_MS: u64 = 100;
+
+            loop {
+                tokio::select! {
+                    // 接收单个数据，缓冲
+                    Some(message) = storage_rx.recv() => {
+                        for resolution in &message.resolutions {
+                            let mut data = message.data.clone();
+                            data.resolution = Some(resolution.as_str().to_string());
+
+                            match resolution {
+                                Resolution::Realtime => realtime_buffer.push(data),
+                                Resolution::TenSeconds => data_10s_buffer.push(data),
+                                Resolution::OneMinute => data_1m_buffer.push(data),
+                                Resolution::OneHour => data_1h_buffer.push(data),
+                            }
+                        }
+                        // 1天数据单独处理
+                        if let Some(data) = message.data_1d {
+                            data_1d_buffer.push(data);
+                        }
+                    }
+                    // 定期批量写入
+                    _ = tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS)) => {
+                        if realtime_buffer.is_empty() {
+                            continue;
+                        }
+
+                        let write_started_at = Instant::now();
+                        let count = realtime_buffer.len();
+
+                        if let Err(error) = db.insert_round_batch(
+                            &realtime_buffer,
+                            &data_10s_buffer,
+                            &data_1m_buffer,
+                            &data_1h_buffer,
+                            &data_1d_buffer,
+                        ) {
+                            log::error!("Failed to store batch data: {}", error);
+                        } else {
+                            log::debug!(
+                                "Stored {} records in {} ms",
+                                count,
+                                write_started_at.elapsed().as_millis()
+                            );
+                        }
+
+                        // 清空缓冲区
+                        realtime_buffer.clear();
+                        data_10s_buffer.clear();
+                        data_1m_buffer.clear();
+                        data_1h_buffer.clear();
+                        data_1d_buffer.clear();
+                    }
+                    _ = shutdown_rx.recv() => {
+                        // 关闭前写入剩余数据
+                        if !realtime_buffer.is_empty() {
+                            if let Err(error) = db.insert_round_batch(
+                                &realtime_buffer,
+                                &data_10s_buffer,
+                                &data_1m_buffer,
+                                &data_1h_buffer,
+                                &data_1d_buffer,
+                            ) {
+                                log::error!("Failed to store remaining data: {}", error);
+                            }
+                        }
+                        log::info!("Data storage stopped");
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// 启动广播任务
+    fn spawn_broadcaster_task(
+        &self,
+        broadcast_rx: mpsc::Receiver<BroadcastMessage>,
+    ) -> tokio::task::JoinHandle<()> {
+        let _namespace_states = Arc::clone(&self.namespace_states);
+        let mut shutdown_rx = self.shutdown.subscribe();
+
+        tokio::spawn(async move {
+            log::info!("Started broadcaster");
+
+            let mut broadcast_rx = broadcast_rx;
+
+            loop {
+                tokio::select! {
+                    Some(message) = broadcast_rx.recv() => {
+                        // 广播消息已在处理层发送，这里可以做额外的处理
+                        // 如日志记录、状态更新等
+                        log::trace!(
+                            "Broadcasted {} data for namespace {}",
+                            message.resolution.as_str(),
+                            message.namespace
+                        );
+                    }
+                    _ = shutdown_rx.recv() => {
+                        log::info!("Broadcaster stopped");
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// 订阅指定命名空间和分辨率的数据
     pub async fn subscribe(
         &self,
         namespace: &str,
         resolution: Resolution,
     ) -> Option<broadcast::Receiver<TrafficData>> {
-        let states = self.namespace_states.read().await;
-        if let Some(state) = states.get(namespace) {
-            log::info!(
-                "New subscriber connected for namespace: {}, resolution: {:?}",
-                namespace,
-                resolution
-            );
-            Some(state.channels.subscribe(resolution))
-        } else {
-            log::warn!("Namespace not found for subscription: {}", namespace);
-            None
-        }
+        let states_guard = self.namespace_states.read().await;
+        states_guard
+            .get(namespace)
+            .map(|state| state.channels.subscribe(resolution))
     }
 
+    /// 获取所有命名空间列表
     pub async fn get_namespaces(&self) -> Vec<String> {
         self.namespace_states.read().await.keys().cloned().collect()
     }
 
+    /// 停止采集器
     pub async fn stop(&self) -> Result<()> {
-        self.shutdown
-            .send(())
-            .context("Failed to send shutdown signal")?;
-        shutdown_all_clients(&self.namespace_states).await;
+        let _ = self.shutdown.send(());
         Ok(())
     }
 }
 
-/// 命名空间聚合状态
-///
-/// 跟踪各分辨率级别的最后聚合时间戳，用于判断是否需要执行新的聚合操作。
-#[derive(Debug, Default, Clone)]
-struct NamespaceAggregationState {
-    /// 最后一次10秒聚合的时间戳
-    last_10s_ts: Option<i64>,
-    /// 最后一次1分钟聚合的时间戳
-    last_1m_ts: Option<i64>,
-    /// 最后一次1小时聚合的时间戳
-    last_1h_ts: Option<i64>,
-    /// 最后一次1天聚合的时间戳
-    last_1d_ts: Option<i64>,
-}
-
-/// 采集进度守卫（RAII模式）
-///
-/// 确保采集标志在作用域退出时自动重置为 false，
-/// 无论正常退出还是发生 panic 都能保证状态一致性。
-struct CollectionProgressGuard {
-    /// 需要管理的采集进度标志
-    flag: Arc<AtomicBool>,
-}
-
-impl CollectionProgressGuard {
-    /// 创建新的采集进度守卫
-    fn new(flag: Arc<AtomicBool>) -> Self {
-        Self { flag }
-    }
-}
-
-impl Drop for CollectionProgressGuard {
-    /// 守卫销毁时自动重置采集标志
-    fn drop(&mut self) {
-        self.flag.store(false, Ordering::Release);
-    }
-}
+// ============================================================================
+// 辅助函数
+// ============================================================================
 
 /// 扫描文件系统中的网络命名空间
-///
-/// 从 /var/run/netns 目录扫描可用的网络命名空间，
-/// 始终包含 "default" 命名空间作为基础选项。
-///
-/// # Returns
-/// 返回发现的命名空间名称列表
 fn scan_namespaces() -> Result<Vec<String>> {
     let mut namespaces = vec!["default".to_string()];
 
     let netns_dir = Path::new("/var/run/netns");
     if netns_dir.exists() {
-        let entries = fs::read_dir(netns_dir).context("Failed to read /var/run/netns directory")?;
-
+        let entries = fs::read_dir(netns_dir).context("Failed to read /var/run/netns")?;
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
                 if !name.is_empty() {
@@ -362,215 +666,88 @@ fn scan_namespaces() -> Result<Vec<String>> {
 }
 
 /// 同步命名空间运行时状态
-///
-/// 根据扫描结果更新命名空间列表、通道、聚合状态和客户端：
-/// - 添加新发现的命名空间及其资源
-/// - 移除已不存在的命名空间及其资源
-/// - 重新创建已关闭的 netlink 客户端
-///
-/// # Arguments
-/// * `namespaces` - 命名空间列表的共享引用
-/// * `channels` - 广播通道映射的共享引用
-/// * `aggregation_state` - 聚合状态映射的共享引用
-/// * `clients` - netlink 客户端映射的共享引用
-/// * `desired_namespaces` - 期望的命名空间列表
 async fn synchronize_namespace_runtime_state(
-    states: &Arc<RwLock<HashMap<String, NamespaceState>>>,
+    states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
     desired_namespaces: &[String],
 ) {
     let mut states_guard = states.write().await;
-    let current_namespaces: Vec<String> = states_guard.keys().cloned().collect();
-
-    if current_namespaces != desired_namespaces {
-        log::info!(
-            "Namespaces changed: {:?} -> {:?}",
-            current_namespaces,
-            desired_namespaces
-        );
-    }
-
-    let desired_set: HashSet<String> = desired_namespaces.iter().cloned().collect();
-    let existing_set: HashSet<String> = current_namespaces.iter().cloned().collect();
 
     // 移除不存在的命名空间
-    let removed_namespaces: Vec<String> = existing_set.difference(&desired_set).cloned().collect();
+    let to_remove: Vec<String> = states_guard
+        .keys()
+        .filter(|k| !desired_namespaces.contains(k))
+        .cloned()
+        .collect();
 
-    for namespace in &removed_namespaces {
-        if let Some(removed_state) = states_guard.remove(namespace) {
-            // 关闭客户端连接
-            if let Some(client) = removed_state.client {
-                if let Err(error) = client.shutdown().await {
-                    log::error!(
-                        "Failed to shut down netlink client for {}: {}",
-                        namespace,
-                        error
-                    );
-                } else {
-                    log::info!("Shut down netlink client for namespace: {}", namespace);
-                }
+    for namespace in to_remove {
+        let namespace_log = namespace.clone();
+        if let Some(state) = states_guard.remove(&namespace) {
+            if let Some(client) = state.client {
+                tokio::spawn(async move {
+                    if let Err(e) = client.shutdown().await {
+                        log::error!("Failed to shutdown client for {}: {}", namespace, e);
+                    }
+                });
             }
-            log::info!("Removed namespace: {}", namespace);
+            log::info!("Removed namespace: {}", namespace_log);
         }
     }
 
-    // 添加新的命名空间
+    // 添加新命名空间
     for namespace in desired_namespaces {
         states_guard
             .entry(namespace.clone())
-            .or_insert_with(NamespaceState::new);
+            .or_insert_with(NamespaceRuntimeState::new);
     }
 
-    // 找出需要重建客户端的命名空间（客户端不存在或已关闭）
-    let stale_namespaces: Vec<String> = states_guard
+    // 检查需要创建/重建的客户端
+    let to_create: Vec<String> = states_guard
         .iter()
-        .filter_map(|(namespace, state)| {
-            if let Some(ref client) = state.client {
-                if client.is_closed() {
-                    log::warn!(
-                        "Recreating closed netlink client for namespace: {}",
-                        namespace
-                    );
-                    Some(namespace.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        .filter(|(_, state)| {
+            state.client.is_none() || state.client.as_ref().map_or(true, |c| c.is_closed())
         })
+        .map(|(ns, _)| ns.clone())
         .collect();
 
-    // 重置过期客户端
-    for namespace in &stale_namespaces {
-        if let Some(state) = states_guard.get_mut(namespace) {
-            state.client = None;
-        }
-    }
+    // 释放锁后创建客户端
+    drop(states_guard);
 
-    let namespaces_to_create: Vec<String> = states_guard
-        .iter()
-        .filter(|(_, state)| state.client.is_none())
-        .map(|(namespace, _)| namespace.clone())
-        .collect();
-
-    // 创建新客户端
-    for namespace in namespaces_to_create {
+    for namespace in to_create {
         match NamespaceNetlinkClient::new(namespace.clone()).await {
             Ok(client) => {
-                log::info!(
-                    "Created long-lived netlink client for namespace: {}",
-                    namespace
-                );
+                let mut states_guard = states.write().await;
                 if let Some(state) = states_guard.get_mut(&namespace) {
                     state.client = Some(Arc::new(client));
                 }
+                log::info!("Created netlink client for namespace: {}", namespace);
             }
             Err(error) => {
-                log::error!(
-                    "Failed to create netlink client for {}: {}",
-                    namespace,
-                    error
-                );
+                log::error!("Failed to create client for {}: {}", namespace, error);
             }
         }
     }
 }
 
-async fn shutdown_all_clients(states: &Arc<RwLock<HashMap<String, NamespaceState>>>) {
-    let clients_to_shutdown: Vec<(String, Arc<NamespaceNetlinkClient>)> = {
+/// 关闭所有客户端
+async fn shutdown_all_clients(states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>) {
+    let clients: Vec<(String, Arc<NamespaceNetlinkClient>)> = {
         let mut states_guard = states.write().await;
         states_guard
             .iter_mut()
-            .filter_map(|(namespace, state)| {
-                state
-                    .client
-                    .take()
-                    .map(|client| (namespace.clone(), client))
-            })
+            .filter_map(|(ns, state)| state.client.take().map(|c| (ns.clone(), c)))
             .collect()
     };
 
-    for (namespace, client) in clients_to_shutdown {
+    for (namespace, client) in clients {
         if let Err(error) = client.shutdown().await {
-            log::error!(
-                "Failed to shut down netlink client for {}: {}",
-                namespace,
-                error
-            );
+            log::error!("Failed to shutdown client for {}: {}", namespace, error);
         } else {
-            log::info!("Shut down netlink client for namespace: {}", namespace);
+            log::info!("Shutdown client for namespace: {}", namespace);
         }
     }
 }
 
-/// 执行一轮并发采集
-///
-/// 对指定命名空间列表执行并发数据采集，使用信号量控制并发度。
-/// 每个命名空间的采集任务在独立的 tokio 任务中执行。
-///
-/// # Arguments
-/// * `namespaces` - 待采集的命名空间列表
-/// * `clients` - netlink 客户端映射
-///
-/// # Returns
-/// 返回每个命名空间的采集结果（命名空间名称，采集结果）
-async fn collect_namespace_round(
-    client_snapshot: &[(String, Option<Arc<NamespaceNetlinkClient>>)],
-) -> Vec<(String, Result<RawTrafficData>)> {
-    let mut results = Vec::with_capacity(client_snapshot.len());
-    let semaphore = Arc::new(Semaphore::new(MAX_NAMESPACE_CONCURRENCY));
-    let mut join_set = JoinSet::new();
-    let collect_started_at = Instant::now();
-
-    for (namespace, client) in client_snapshot.iter().cloned() {
-        let semaphore = Arc::clone(&semaphore);
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .expect("collection semaphore closed unexpectedly");
-
-            let result = match client {
-                Some(client) => collect_namespace_data(&namespace, &client).await,
-                None => Err(anyhow!(
-                    "no netlink client available for namespace {}",
-                    namespace
-                )),
-            };
-
-            (namespace, result)
-        });
-    }
-
-    while let Some(join_result) = join_set.join_next().await {
-        match join_result {
-            Ok((namespace, result)) => results.push((namespace, result)),
-            Err(error) => {
-                log::error!("Collection task failed: {}", error);
-            }
-        }
-    }
-
-    log::debug!(
-        "Collection timing [round] collect_namespace_round finished in {} ms for {} namespaces",
-        collect_started_at.elapsed().as_millis(),
-        client_snapshot.len()
-    );
-
-    results
-}
-
-/// 采集单个命名空间的流量数据
-///
-/// 通过 netlink 客户端获取指定命名空间的网络接口统计数据，
-/// 并附带当前时间戳。
-///
-/// # Arguments
-/// * `namespace` - 命名空间名称
-/// * `client` - netlink 客户端引用
-///
-/// # Returns
-/// 返回包含流量数据的 TrafficData 结构体
+/// 采集单个命名空间的数据
 async fn collect_namespace_data(
     namespace: &str,
     client: &NamespaceNetlinkClient,
@@ -592,42 +769,23 @@ async fn collect_namespace_data(
     })
 }
 
-/// 判断是否需要进行聚合
-///
-/// 将当前时间戳对齐到聚合间隔后，与上次聚合时间戳比较。
-/// 如果对齐后的时间戳晚于上次聚合时间戳，或从未聚合过，则需要聚合。
-///
-/// # Arguments
-/// * `current_ts` - 当前时间戳（毫秒）
-/// * `last_ts` - 上次聚合的对齐时间戳
-/// * `interval_ms` - 聚合间隔（毫秒）
-///
-/// # Returns
-/// 如果需要执行聚合则返回 true
+/// 判断是否需要聚合
 fn should_aggregate(current_ts: i64, last_ts: Option<i64>, interval_ms: i64) -> bool {
     let current_aligned = align_timestamp(current_ts, interval_ms);
-
     match last_ts {
         None => true,
         Some(last) => current_aligned > last,
     }
 }
 
-/// 将时间戳对齐到聚合间隔
-///
-/// 向下取整到最近的间隔倍数，例如：
-/// - 时间戳 15500ms，间隔 10000ms → 10000ms
-/// - 时间戳 25000ms，间隔 10000ms → 20000ms
-///
-/// # Arguments
-/// * `timestamp_ms` - 原始时间戳（毫秒）
-/// * `interval_ms` - 聚合间隔（毫秒）
-///
-/// # Returns
-/// 对齐后的时间戳
+/// 对齐时间戳到聚合间隔
 fn align_timestamp(timestamp_ms: i64, interval_ms: i64) -> i64 {
     (timestamp_ms / interval_ms) * interval_ms
 }
+
+// ============================================================================
+// 测试
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
