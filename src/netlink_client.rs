@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*;
+    use crate::netns;
     use anyhow::Context;
     use futures_util::stream::TryStreamExt;
     use rtnetlink::{
@@ -12,14 +13,9 @@ mod imp {
         Handle,
     };
 
-    use tokio::sync::Mutex;
-
-    use crate::netns;
-
     pub struct NamespaceNetlinkClient {
         namespace: String,
         handle: Handle,
-        collect_lock: Mutex<()>,
     }
 
     impl NamespaceNetlinkClient {
@@ -45,16 +41,10 @@ mod imp {
                 );
             });
 
-            Ok(Self {
-                namespace,
-                handle,
-                collect_lock: Mutex::new(()),
-            })
+            Ok(Self { namespace, handle })
         }
 
         pub async fn collect_interfaces(&self) -> Result<Vec<RawInterfaceStats>> {
-            let _guard = self.collect_lock.lock().await;
-
             self.load_link_stats().await.with_context(|| {
                 format!(
                     "failed to collect interface stats for namespace {}",

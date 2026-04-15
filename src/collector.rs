@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -38,14 +38,13 @@ const INTERVAL_1M: i64 = 60_000;
 const INTERVAL_1H: i64 = 3_600_000;
 /// 1天聚合间隔（单位：毫秒）
 const INTERVAL_1D: i64 = 86_400_000;
-/// 命名空间并发采集上限
-const MAX_NAMESPACE_CONCURRENCY: usize = 20;
+
 /// 采集结果 channel 缓冲区大小
-const COLLECTION_CHANNEL_SIZE: usize = 100;
+const COLLECTION_CHANNEL_SIZE: usize = 200;
 /// 存储请求 channel 缓冲区大小
-const STORAGE_CHANNEL_SIZE: usize = 100;
+const STORAGE_CHANNEL_SIZE: usize = 200;
 /// 广播通道缓冲区大小
-const BROADCAST_CHANNEL_SIZE: usize = 100;
+const BROADCAST_CHANNEL_SIZE: usize = 200;
 
 // ============================================================================
 // 数据结构定义
@@ -336,26 +335,22 @@ impl TrafficCollector {
         namespace_states: &Arc<DashMap<String, NamespaceRuntimeState>>,
         collection_tx: &mpsc::Sender<CollectionMessage>,
     ) {
+        let round_start = Instant::now();
+
         // 获取客户端快照（DashMap 无需锁，直接迭代）
         let clients_snapshot: Vec<(String, Option<Arc<NamespaceNetlinkClient>>)> = namespace_states
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().client.clone()))
             .collect();
 
-        // 并发采集
-        let semaphore = Arc::new(Semaphore::new(MAX_NAMESPACE_CONCURRENCY));
+        // 并发采集（无限制，所有命名空间同时开始）
         let mut join_set = JoinSet::new();
+        let namespace_count = clients_snapshot.len();
 
         for (namespace, client) in clients_snapshot {
-            let semaphore = Arc::clone(&semaphore);
             let collection_tx = collection_tx.clone();
 
             join_set.spawn(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .expect("collection semaphore closed unexpectedly");
-
                 let result = match client {
                     Some(client) => collect_namespace_data(&namespace, &client).await,
                     None => Err(anyhow!("no netlink client for namespace {}", namespace)),
@@ -378,6 +373,12 @@ impl TrafficCollector {
                 log::error!("Collection task panicked: {}", error);
             }
         }
+
+        log::info!(
+            "Collection round completed: {} namespaces in {} ms",
+            namespace_count,
+            round_start.elapsed().as_millis()
+        );
     }
 
     /// 启动处理任务
@@ -787,6 +788,7 @@ async fn collect_namespace_data(
     client: &NamespaceNetlinkClient,
 ) -> Result<RawTrafficData> {
     let timestamp = Utc::now();
+
     let interfaces = client.collect_interfaces().await.with_context(|| {
         format!(
             "failed to collect interface stats for namespace {}",
