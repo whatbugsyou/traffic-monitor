@@ -11,13 +11,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -68,6 +68,7 @@ struct StorageMessage {
 /// 广播请求消息（处理层 → 广播层）
 struct BroadcastMessage {
     namespace: String,
+    #[allow(dead_code)]
     data: TrafficData,
     resolution: Resolution,
 }
@@ -171,8 +172,8 @@ impl Drop for CollectionProgressGuard {
 pub struct TrafficCollector {
     db: Arc<Database>,
     config: CollectorConfig,
-    /// 命名空间运行时状态（独立锁）
-    namespace_states: Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
+    /// 命名空间运行时状态（使用 DashMap 实现细粒度锁）
+    namespace_states: Arc<DashMap<String, NamespaceRuntimeState>>,
     /// 采集任务进行中标记
     collection_in_progress: Arc<AtomicBool>,
     /// 任务取消令牌（Tokio 官方方案）
@@ -191,9 +192,9 @@ impl Drop for TrafficCollector {
 
 impl TrafficCollector {
     pub fn new(db: Arc<Database>, config: CollectorConfig) -> Result<Self> {
-        let mut states = HashMap::new();
+        let states = DashMap::new();
         states.insert("default".to_string(), NamespaceRuntimeState::new());
-        let namespace_states = Arc::new(RwLock::new(states));
+        let namespace_states = Arc::new(states);
         let collection_in_progress = Arc::new(AtomicBool::new(false));
         let cancel_token = CancellationToken::new();
         let tasks = Mutex::new(JoinSet::new());
@@ -332,17 +333,14 @@ impl TrafficCollector {
 
     /// 执行一轮采集（只获取快照，不等待同步）
     async fn run_collection_round(
-        namespace_states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
+        namespace_states: &Arc<DashMap<String, NamespaceRuntimeState>>,
         collection_tx: &mpsc::Sender<CollectionMessage>,
     ) {
-        // 获取客户端快照（一次读锁，快速完成）
-        let clients_snapshot: Vec<(String, Option<Arc<NamespaceNetlinkClient>>)> = {
-            let states_guard = namespace_states.read().await;
-            states_guard
-                .iter()
-                .map(|(namespace, state)| (namespace.clone(), state.client.clone()))
-                .collect()
-        };
+        // 获取客户端快照（DashMap 无需锁，直接迭代）
+        let clients_snapshot: Vec<(String, Option<Arc<NamespaceNetlinkClient>>)> = namespace_states
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().client.clone()))
+            .collect();
 
         // 并发采集
         let semaphore = Arc::new(Semaphore::new(MAX_NAMESPACE_CONCURRENCY));
@@ -427,7 +425,7 @@ impl TrafficCollector {
 
     /// 处理单个采集消息，立即发送到存储层
     async fn process_collection_message(
-        namespace_states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
+        namespace_states: &Arc<DashMap<String, NamespaceRuntimeState>>,
         message: CollectionMessage,
         storage_tx: &mpsc::Sender<StorageMessage>,
         broadcast_tx: &mpsc::Sender<BroadcastMessage>,
@@ -439,11 +437,10 @@ impl TrafficCollector {
                 *success_count += 1;
                 let timestamp_ms = data.timestamp_ms;
 
-                // 获取命名空间状态（独立锁）
+                // 获取命名空间状态（DashMap 细粒度锁）
                 let (channels, agg_state) = {
-                    let states_guard = namespace_states.read().await;
-                    if let Some(state) = states_guard.get(&message.namespace) {
-                        (state.channels.clone(), state.aggregation_state.clone())
+                    if let Some(entry) = namespace_states.get(&message.namespace) {
+                        (entry.channels.clone(), entry.aggregation_state.clone())
                     } else {
                         log::warn!("Namespace {} not found in states", message.namespace);
                         return;
@@ -494,12 +491,9 @@ impl TrafficCollector {
                         None
                     };
 
-                // 更新聚合状态
-                {
-                    let mut states_guard = namespace_states.write().await;
-                    if let Some(state) = states_guard.get_mut(&message.namespace) {
-                        state.aggregation_state = new_agg_state;
-                    }
+                // 更新聚合状态（DashMap 细粒度锁）
+                if let Some(mut entry) = namespace_states.get_mut(&message.namespace) {
+                    entry.aggregation_state = new_agg_state;
                 }
 
                 // 立即发送到存储层
@@ -523,10 +517,9 @@ impl TrafficCollector {
                     error
                 );
 
-                // 清空客户端，下次扫描自动重建
-                let mut states_guard = namespace_states.write().await;
-                if let Some(state) = states_guard.get_mut(&message.namespace) {
-                    state.client = None;
+                // 清空客户端，下次扫描自动重建（DashMap 细粒度锁）
+                if let Some(mut entry) = namespace_states.get_mut(&message.namespace) {
+                    entry.client = None;
                     log::info!(
                         "Cleared client for {} due to collection failure",
                         message.namespace
@@ -667,15 +660,17 @@ impl TrafficCollector {
         namespace: &str,
         resolution: Resolution,
     ) -> Option<broadcast::Receiver<TrafficData>> {
-        let states_guard = self.namespace_states.read().await;
-        states_guard
+        self.namespace_states
             .get(namespace)
-            .map(|state| state.channels.subscribe(resolution))
+            .map(|entry| entry.channels.subscribe(resolution))
     }
 
     /// 获取所有命名空间列表
     pub async fn get_namespaces(&self) -> Vec<String> {
-        self.namespace_states.read().await.keys().cloned().collect()
+        self.namespace_states
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// 停止采集器，等待所有任务完成清理
@@ -730,48 +725,42 @@ fn scan_namespaces() -> Result<Vec<String>> {
 
 /// 同步命名空间运行时状态
 async fn synchronize_namespace_runtime_state(
-    states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>,
+    states: &Arc<DashMap<String, NamespaceRuntimeState>>,
     desired_namespaces: &[String],
 ) {
-    let mut states_guard = states.write().await;
-
     // 移除不存在的命名空间
-    let to_remove: Vec<String> = states_guard
-        .keys()
+    let to_remove: Vec<String> = states
+        .iter()
+        .map(|entry| entry.key().clone())
         .filter(|k| !desired_namespaces.contains(k))
-        .cloned()
         .collect();
 
     for namespace in to_remove {
-        if let Some(_state) = states_guard.remove(&namespace) {
-            // state.client 会在这里被自动 drop，RAII 机制会清理资源
+        if states.remove(&namespace).is_some() {
             log::info!("Removed namespace: {}", namespace);
         }
     }
 
     // 添加新命名空间
     for namespace in desired_namespaces {
-        states_guard
+        states
             .entry(namespace.clone())
             .or_insert_with(NamespaceRuntimeState::new);
     }
 
     // 检查需要创建/重建的客户端
-    let to_create: Vec<String> = states_guard
+    let to_create: Vec<String> = states
         .iter()
-        .filter(|(_, state)| state.client.is_none())
-        .map(|(ns, _)| ns.clone())
+        .filter(|entry| entry.client.is_none())
+        .map(|entry| entry.key().clone())
         .collect();
 
-    // 释放锁后创建客户端
-    drop(states_guard);
-
+    // 创建客户端（无锁操作）
     for namespace in to_create {
         match NamespaceNetlinkClient::new(namespace.clone()).await {
             Ok(client) => {
-                let mut states_guard = states.write().await;
-                if let Some(state) = states_guard.get_mut(&namespace) {
-                    state.client = Some(Arc::new(client));
+                if let Some(mut entry) = states.get_mut(&namespace) {
+                    entry.client = Some(Arc::new(client));
                 }
                 log::info!("Created netlink client for namespace: {}", namespace);
             }
@@ -783,11 +772,11 @@ async fn synchronize_namespace_runtime_state(
 }
 
 /// 关闭所有客户端
-async fn shutdown_all_clients(states: &Arc<RwLock<HashMap<String, NamespaceRuntimeState>>>) {
-    let mut states_guard = states.write().await;
-    let count = states_guard
+#[allow(dead_code)]
+async fn shutdown_all_clients(states: &Arc<DashMap<String, NamespaceRuntimeState>>) {
+    let count = states
         .iter_mut()
-        .filter_map(|(_, state)| state.client.take())
+        .filter_map(|mut entry| entry.client.take())
         .count();
     log::info!("Cleared {} namespace clients (RAII cleanup)", count);
 }
