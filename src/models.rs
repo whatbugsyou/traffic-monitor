@@ -112,6 +112,7 @@ impl From<RawTrafficData> for TrafficData {
 
 impl InterfaceStats {
     /// 从原始数据创建，保留累计值，速度字段初始化为 None
+    #[allow(dead_code)]
     pub fn from_raw(raw: RawInterfaceStats) -> Self {
         Self::from(raw)
     }
@@ -119,6 +120,7 @@ impl InterfaceStats {
 
 impl TrafficData {
     /// 从原始数据创建
+    #[allow(dead_code)]
     pub fn from_raw(raw: RawTrafficData) -> Self {
         Self::from(raw)
     }
@@ -188,6 +190,7 @@ pub fn calculate_speeds_for_list(data_list: &mut [TrafficData]) {
 }
 
 /// 计算原始数据列表的速度，返回带速度的 TrafficData 列表
+#[allow(dead_code)]
 pub fn calculate_speeds_from_raw_list(raw_list: &[RawTrafficData]) -> Vec<TrafficData> {
     let mut result: Vec<TrafficData> = raw_list.iter().cloned().map(TrafficData::from).collect();
     calculate_speeds_for_list(&mut result);

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::models::{DatabaseConfig, RawInterfaceStats, RawTrafficData, TrafficData};
+use crate::models::{DatabaseConfig, RawTrafficData, TrafficData};
 
 /// 数据库管理器
 #[derive(Debug)]
@@ -460,7 +460,7 @@ mod tests {
             namespace: "test".to_string(),
             timestamp: "2024-01-01 00:00:00".to_string(),
             timestamp_ms: 1704067200000,
-            interfaces: vec![RawInterfaceStats {
+            interfaces: vec![crate::models::RawInterfaceStats {
                 name: "eth0".to_string(),
                 rx_bytes: 1024,
                 tx_bytes: 2048,

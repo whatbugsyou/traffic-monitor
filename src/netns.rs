@@ -1,4 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 
 #[cfg(target_os = "linux")]
 use std::fs::File;
@@ -109,17 +112,20 @@ where
 // ============================================================================
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn current_tid() -> libc::pid_t {
     // 非 Linux 平台不支持 gettid，返回进程 ID 作为替代
     unsafe { libc::getpid() }
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub struct NamespaceGuard {
     _target_namespace: Option<String>,
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 impl NamespaceGuard {
     pub fn enter(namespace: &str) -> Result<Option<Self>> {
         if namespace == "default" {
@@ -144,6 +150,7 @@ impl Drop for NamespaceGuard {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn run_in_namespace<T, F>(namespace: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
