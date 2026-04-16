@@ -39,7 +39,9 @@ impl HttpServerWrapper {
         log::info!("API endpoints:");
         log::info!("  GET /api/namespaces                      - List namespaces");
         log::info!("  GET /api/current?namespace=<ns>          - Current data");
-        log::info!("  GET /api/history?namespace=<ns>&duration=<min>&resolution=<res> - Historical data");
+        log::info!(
+            "  GET /api/history?namespace=<ns>&duration=<min>&resolution=<res> - Historical data"
+        );
         log::info!("  GET /api/stream?namespace=<ns>&duration=<min>&resolution=<res> - SSE real-time stream");
 
         let server = HttpServer::new(move || {
@@ -174,7 +176,10 @@ async fn sse_stream(
     // 从数据库获取最近一条数据作为 prev_data 的初始值
     let initial_data = db.get_current_data(&namespace).ok().flatten();
     if initial_data.is_some() {
-        log::debug!("SSE stream initialized with previous data for namespace: {}", namespace);
+        log::debug!(
+            "SSE stream initialized with previous data for namespace: {}",
+            namespace
+        );
     }
 
     // 创建 SSE 流（精准订阅，计算速度后发送）
@@ -256,9 +261,8 @@ mod tests {
         let config = DatabaseConfig::default();
         let db = Arc::new(Database::new(config).unwrap());
 
-        let collector = Arc::new(
-            TrafficCollector::new(Arc::clone(&db), CollectorConfig::default()).unwrap(),
-        );
+        let collector =
+            Arc::new(TrafficCollector::new(Arc::clone(&db), CollectorConfig::default()).unwrap());
 
         let app = App::new()
             .app_data(web::Data::new(db))

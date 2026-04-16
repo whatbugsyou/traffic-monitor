@@ -9,7 +9,7 @@
 //!                                      ▼
 //!                               Broadcaster ─► 前端
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use dashmap::DashMap;
 use std::fs;
@@ -120,22 +120,42 @@ struct NamespaceAggregationState {
 }
 
 /// 单个命名空间的运行时状态
-struct NamespaceRuntimeState {
+pub(crate) struct NamespaceRuntimeState {
+    /// 命名空间名称
+    pub(crate) namespace: String,
     /// 广播通道
     channels: ResolutionChannels,
     /// 聚合状态
     aggregation_state: NamespaceAggregationState,
     /// netlink 客户端
-    client: Option<Arc<NamespaceNetlinkClient>>,
+    pub(crate) client: Option<Arc<NamespaceNetlinkClient>>,
 }
 
 impl NamespaceRuntimeState {
-    fn new() -> Self {
-        Self {
+    /// 创建完整的状态（包含客户端）
+    async fn new(namespace: &str) -> Result<Self> {
+        let client = NamespaceNetlinkClient::new(namespace.to_string())
+            .await
+            .with_context(|| format!("Failed to create client for namespace {}", namespace))?;
+
+        Ok(Self {
+            namespace: namespace.to_string(),
             channels: ResolutionChannels::new(),
             aggregation_state: NamespaceAggregationState::default(),
-            client: None,
-        }
+            client: Some(Arc::new(client)),
+        })
+    }
+
+    /// 重建客户端（用于客户端失效后恢复）
+    async fn rebuild_client(&mut self) -> Result<()> {
+        let client = NamespaceNetlinkClient::new(self.namespace.clone())
+            .await
+            .with_context(|| {
+                format!("Failed to rebuild client for namespace {}", self.namespace)
+            })?;
+
+        self.client = Some(Arc::new(client));
+        Ok(())
     }
 }
 
@@ -191,9 +211,7 @@ impl Drop for TrafficCollector {
 
 impl TrafficCollector {
     pub fn new(db: Arc<Database>, config: CollectorConfig) -> Result<Self> {
-        let states = DashMap::new();
-        states.insert("default".to_string(), NamespaceRuntimeState::new());
-        let namespace_states = Arc::new(states);
+        let namespace_states = Arc::new(DashMap::new());
         let collection_in_progress = Arc::new(AtomicBool::new(false));
         let cancel_token = CancellationToken::new();
         let tasks = Mutex::new(JoinSet::new());
@@ -337,10 +355,14 @@ impl TrafficCollector {
     ) {
         let round_start = Instant::now();
 
-        // 获取客户端快照（DashMap 无需锁，直接迭代）
-        let clients_snapshot: Vec<(String, Option<Arc<NamespaceNetlinkClient>>)> = namespace_states
+        // 获取客户端快照（迭代期间持有读锁，clone 数据后立即释放）
+        let clients_snapshot: Vec<_> = namespace_states
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().client.clone()))
+            .filter_map(|entry| {
+                let namespace = entry.key().clone();
+                let client = entry.value().client.clone()?;
+                Some((namespace, client))
+            })
             .collect();
 
         // 并发采集（无限制，所有命名空间同时开始）
@@ -351,10 +373,7 @@ impl TrafficCollector {
             let collection_tx = collection_tx.clone();
 
             join_set.spawn(async move {
-                let result = match client {
-                    Some(client) => collect_namespace_data(&namespace, &client).await,
-                    None => Err(anyhow!("no netlink client for namespace {}", namespace)),
-                };
+                let result = collect_namespace_data(&namespace, &client).await;
 
                 // 发送采集结果到处理层
                 if collection_tx
@@ -742,31 +761,47 @@ async fn synchronize_namespace_runtime_state(
         }
     }
 
-    // 添加新命名空间
-    for namespace in desired_namespaces {
-        states
-            .entry(namespace.clone())
-            .or_insert_with(NamespaceRuntimeState::new);
-    }
-
-    // 检查需要创建/重建的客户端
-    let to_create: Vec<String> = states
+    // 找出需要重建客户端的命名空间（client 为 None 但状态存在）
+    let to_rebuild: Vec<String> = states
         .iter()
         .filter(|entry| entry.client.is_none())
         .map(|entry| entry.key().clone())
         .collect();
 
-    // 创建客户端（无锁操作）
-    for namespace in to_create {
-        match NamespaceNetlinkClient::new(namespace.clone()).await {
-            Ok(client) => {
-                if let Some(mut entry) = states.get_mut(&namespace) {
-                    entry.client = Some(Arc::new(client));
+    // 重建客户端
+    for namespace in to_rebuild {
+        if let Some(mut entry) = states.get_mut(&namespace) {
+            match entry.rebuild_client().await {
+                Ok(()) => {
+                    log::info!("Rebuilt netlink client for namespace: {}", namespace);
                 }
-                log::info!("Created netlink client for namespace: {}", namespace);
+                Err(error) => {
+                    log::error!("Failed to rebuild client for {}: {}", namespace, error);
+                }
+            }
+        }
+    }
+
+    // 找出真正新的命名空间（不存在于 states 中）
+    let new_namespaces: Vec<String> = desired_namespaces
+        .iter()
+        .filter(|ns| !states.contains_key(*ns))
+        .cloned()
+        .collect();
+
+    // 为新命名空间创建完整的状态（包含客户端）
+    for namespace in new_namespaces {
+        match NamespaceRuntimeState::new(&namespace).await {
+            Ok(state) => {
+                states.insert(namespace.clone(), state);
+                log::info!("Created namespace state with client: {}", namespace);
             }
             Err(error) => {
-                log::error!("Failed to create client for {}: {}", namespace, error);
+                log::error!(
+                    "Failed to create namespace state for {}: {}",
+                    namespace,
+                    error
+                );
             }
         }
     }
