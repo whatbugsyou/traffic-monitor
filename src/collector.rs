@@ -566,7 +566,17 @@ impl TrafficCollector {
             let mut data_1m_buffer = Vec::new();
             let mut data_1h_buffer = Vec::new();
             let mut data_1d_buffer = Vec::new();
-            const FLUSH_INTERVAL_MS: u64 = 100;
+            const FLUSH_INTERVAL_MS: u64 = 250;
+            const MAX_BUFFERED_ROWS: usize = 512;
+            const CLEANUP_INTERVAL_SECS: u64 = 30;
+
+            let mut flush_interval = interval(Duration::from_millis(FLUSH_INTERVAL_MS));
+            flush_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            flush_interval.tick().await;
+
+            let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
+            cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            cleanup_interval.tick().await;
 
             loop {
                 tokio::select! {
@@ -587,17 +597,47 @@ impl TrafficCollector {
                         if let Some(data) = message.data_1d {
                             data_1d_buffer.push(data);
                         }
+
+                        if buffered_storage_rows(
+                            &realtime_buffer,
+                            &data_10s_buffer,
+                            &data_1m_buffer,
+                            &data_1h_buffer,
+                            &data_1d_buffer,
+                        ) >= MAX_BUFFERED_ROWS
+                        {
+                            if let Err(error) = flush_storage_buffers(
+                                &db,
+                                &realtime_buffer,
+                                &data_10s_buffer,
+                                &data_1m_buffer,
+                                &data_1h_buffer,
+                                &data_1d_buffer,
+                            ) {
+                                log::error!("Failed to store full buffers: {}", error);
+                            }
+
+                            realtime_buffer.clear();
+                            data_10s_buffer.clear();
+                            data_1m_buffer.clear();
+                            data_1h_buffer.clear();
+                            data_1d_buffer.clear();
+                        }
                     }
-                    // 定期批量写入
-                    _ = tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS)) => {
-                        if realtime_buffer.is_empty() {
+                    // 固定周期批量写入，避免高吞吐时被持续重置成“空闲后再写”。
+                    _ = flush_interval.tick() => {
+                        if storage_buffers_empty(
+                            &realtime_buffer,
+                            &data_10s_buffer,
+                            &data_1m_buffer,
+                            &data_1h_buffer,
+                            &data_1d_buffer,
+                        ) {
                             continue;
                         }
 
-                        let write_started_at = Instant::now();
-                        let count = realtime_buffer.len();
-
-                        if let Err(error) = db.insert_round_batch(
+                        if let Err(error) = flush_storage_buffers(
+                            &db,
                             &realtime_buffer,
                             &data_10s_buffer,
                             &data_1m_buffer,
@@ -605,12 +645,6 @@ impl TrafficCollector {
                             &data_1d_buffer,
                         ) {
                             log::error!("Failed to store batch data: {}", error);
-                        } else {
-                            log::debug!(
-                                "Stored {} records in {} ms",
-                                count,
-                                write_started_at.elapsed().as_millis()
-                            );
                         }
 
                         // 清空缓冲区
@@ -620,10 +654,34 @@ impl TrafficCollector {
                         data_1h_buffer.clear();
                         data_1d_buffer.clear();
                     }
+                    // 定时批量清理，避免在插入事务内叠加删除压力。
+                    _ = cleanup_interval.tick() => {
+                        let cleanup_started_at = Instant::now();
+                        match db.cleanup_expired_data(Utc::now().timestamp_millis()) {
+                            Ok(deleted_rows) if deleted_rows > 0 => {
+                                log::debug!(
+                                    "Cleaned up {} expired rows in {} ms",
+                                    deleted_rows,
+                                    cleanup_started_at.elapsed().as_millis()
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                log::error!("Failed to cleanup expired data: {}", error);
+                            }
+                        }
+                    }
                     _ = cancel_token.cancelled() => {
                         // 关闭前写入剩余数据
-                        if !realtime_buffer.is_empty() {
-                            if let Err(error) = db.insert_round_batch(
+                        if !storage_buffers_empty(
+                            &realtime_buffer,
+                            &data_10s_buffer,
+                            &data_1m_buffer,
+                            &data_1h_buffer,
+                            &data_1d_buffer,
+                        ) {
+                            if let Err(error) = flush_storage_buffers(
+                                &db,
                                 &realtime_buffer,
                                 &data_10s_buffer,
                                 &data_1m_buffer,
@@ -852,6 +910,72 @@ fn should_aggregate(current_ts: i64, last_ts: Option<i64>, interval_ms: i64) -> 
 /// 对齐时间戳到聚合间隔
 fn align_timestamp(timestamp_ms: i64, interval_ms: i64) -> i64 {
     (timestamp_ms / interval_ms) * interval_ms
+}
+
+fn storage_buffers_empty(
+    realtime_buffer: &[RawTrafficData],
+    data_10s_buffer: &[RawTrafficData],
+    data_1m_buffer: &[RawTrafficData],
+    data_1h_buffer: &[RawTrafficData],
+    data_1d_buffer: &[RawTrafficData],
+) -> bool {
+    realtime_buffer.is_empty()
+        && data_10s_buffer.is_empty()
+        && data_1m_buffer.is_empty()
+        && data_1h_buffer.is_empty()
+        && data_1d_buffer.is_empty()
+}
+
+fn buffered_storage_rows(
+    realtime_buffer: &[RawTrafficData],
+    data_10s_buffer: &[RawTrafficData],
+    data_1m_buffer: &[RawTrafficData],
+    data_1h_buffer: &[RawTrafficData],
+    data_1d_buffer: &[RawTrafficData],
+) -> usize {
+    realtime_buffer.len()
+        + data_10s_buffer.len()
+        + data_1m_buffer.len()
+        + data_1h_buffer.len()
+        + data_1d_buffer.len()
+}
+
+fn flush_storage_buffers(
+    db: &Database,
+    realtime_buffer: &[RawTrafficData],
+    data_10s_buffer: &[RawTrafficData],
+    data_1m_buffer: &[RawTrafficData],
+    data_1h_buffer: &[RawTrafficData],
+    data_1d_buffer: &[RawTrafficData],
+) -> Result<()> {
+    let write_started_at = Instant::now();
+    let raw_count = realtime_buffer.len();
+    let agg_10s_count = data_10s_buffer.len();
+    let agg_1m_count = data_1m_buffer.len();
+    let agg_1h_count = data_1h_buffer.len();
+    let agg_1d_count = data_1d_buffer.len();
+    let total_count = raw_count + agg_10s_count + agg_1m_count + agg_1h_count + agg_1d_count;
+
+    db.insert_round_batch(
+        realtime_buffer,
+        data_10s_buffer,
+        data_1m_buffer,
+        data_1h_buffer,
+        data_1d_buffer,
+    )?;
+
+    log::debug!(
+        "Stored {} records in {} ms (raw={} 10s={} 1m={} 1h={} 1d={})",
+        total_count,
+        write_started_at.elapsed().as_millis(),
+        raw_count,
+        agg_10s_count,
+        agg_1m_count,
+        agg_1h_count,
+        agg_1d_count
+    );
+
+    Ok(())
 }
 
 // ============================================================================
