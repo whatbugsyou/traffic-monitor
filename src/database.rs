@@ -7,19 +7,90 @@ use std::time::Instant;
 
 use crate::models::*;
 
-/// 数据库管理器
 #[derive(Debug)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
     config: DatabaseConfig,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TableKind {
+    Raw,
+    TenSeconds,
+    OneMinute,
+    OneHour,
+    OneDay,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TableSpec {
+    kind: TableKind,
+    name: &'static str,
+    query_index_name: &'static str,
+    cleanup_index_name: &'static str,
+    cleanup_trigger_name: &'static str,
+}
+
+#[derive(Debug)]
+struct TableInspection {
+    has_created_at: bool,
+    has_unique_index: bool,
+}
+
+const TABLE_SPECS: [TableSpec; 5] = [
+    TableSpec {
+        kind: TableKind::Raw,
+        name: "traffic_history",
+        query_index_name: "idx_history_namespace_ts",
+        cleanup_index_name: "idx_history_timestamp_ms",
+        cleanup_trigger_name: "cleanup_raw_data",
+    },
+    TableSpec {
+        kind: TableKind::TenSeconds,
+        name: "traffic_history_10s",
+        query_index_name: "idx_10s_namespace_ts",
+        cleanup_index_name: "idx_10s_timestamp_ms",
+        cleanup_trigger_name: "cleanup_10s_data",
+    },
+    TableSpec {
+        kind: TableKind::OneMinute,
+        name: "traffic_history_1m",
+        query_index_name: "idx_1m_namespace_ts",
+        cleanup_index_name: "idx_1m_timestamp_ms",
+        cleanup_trigger_name: "cleanup_1m_data",
+    },
+    TableSpec {
+        kind: TableKind::OneHour,
+        name: "traffic_history_1h",
+        query_index_name: "idx_1h_namespace_ts",
+        cleanup_index_name: "idx_1h_timestamp_ms",
+        cleanup_trigger_name: "cleanup_1h_data",
+    },
+    TableSpec {
+        kind: TableKind::OneDay,
+        name: "traffic_history_1d",
+        query_index_name: "idx_1d_namespace_ts",
+        cleanup_index_name: "idx_1d_timestamp_ms",
+        cleanup_trigger_name: "cleanup_1d_data",
+    },
+];
+
+impl TableSpec {
+    fn retention_ms(self, config: &DatabaseConfig) -> i64 {
+        match self.kind {
+            TableKind::Raw => config.retention_raw_minutes as i64 * 60 * 1000,
+            TableKind::TenSeconds => config.retention_10s_hours as i64 * 60 * 60 * 1000,
+            TableKind::OneMinute => config.retention_1m_hours as i64 * 60 * 60 * 1000,
+            TableKind::OneHour => config.retention_1h_days as i64 * 24 * 60 * 60 * 1000,
+            TableKind::OneDay => config.retention_1d_days as i64 * 24 * 60 * 60 * 1000,
+        }
+    }
+}
+
 impl Database {
-    /// 创建新的数据库连接
     pub fn new(config: DatabaseConfig) -> Result<Self> {
         let db_path = Path::new(&config.db_path);
 
-        // 确保数据库目录存在
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create database directory: {:?}", parent))?;
@@ -48,213 +119,46 @@ impl Database {
         Ok(db)
     }
 
-    /// 初始化数据库表结构
     fn initialize(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
 
-        // 创建原始数据表
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS traffic_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                namespace TEXT NOT NULL DEFAULT 'default',
-                timestamp TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(namespace, timestamp_ms)
-            )",
-            [],
-        )
-        .context("Failed to create traffic_history table")?;
+        for spec in TABLE_SPECS {
+            ensure_table_exists(&conn, spec)?;
+            let inspection = inspect_table(&conn, spec)?;
 
-        // 创建10秒聚合表
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS traffic_history_10s (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                namespace TEXT NOT NULL DEFAULT 'default',
-                timestamp TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(namespace, timestamp_ms)
-            )",
-            [],
-        )
-        .context("Failed to create traffic_history_10s table")?;
+            if !inspection.has_created_at || inspection.has_unique_index {
+                rebuild_table(&mut conn, spec, inspection.has_created_at)?;
+            }
+        }
 
-        // 创建1分钟聚合表
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS traffic_history_1m (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                namespace TEXT NOT NULL DEFAULT 'default',
-                timestamp TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(namespace, timestamp_ms)
-            )",
-            [],
-        )
-        .context("Failed to create traffic_history_1m table")?;
-
-        // 创建1小时聚合表
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS traffic_history_1h (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                namespace TEXT NOT NULL DEFAULT 'default',
-                timestamp TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(namespace, timestamp_ms)
-            )",
-            [],
-        )
-        .context("Failed to create traffic_history_1h table")?;
-
-        // 创建1天聚合表
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS traffic_history_1d (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                namespace TEXT NOT NULL DEFAULT 'default',
-                timestamp TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(namespace, timestamp_ms)
-            )",
-            [],
-        )
-        .context("Failed to create traffic_history_1d table")?;
-
-        // 创建索引
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_history_namespace_ts
-             ON traffic_history(namespace, timestamp_ms)",
-            [],
-        )
-        .context("Failed to create index on traffic_history")?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_10s_namespace_ts
-             ON traffic_history_10s(namespace, timestamp_ms)",
-            [],
-        )
-        .context("Failed to create index on traffic_history_10s")?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_1m_namespace_ts
-             ON traffic_history_1m(namespace, timestamp_ms)",
-            [],
-        )
-        .context("Failed to create index on traffic_history_1m")?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_1h_namespace_ts
-             ON traffic_history_1h(namespace, timestamp_ms)",
-            [],
-        )
-        .context("Failed to create index on traffic_history_1h")?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_1d_namespace_ts
-             ON traffic_history_1d(namespace, timestamp_ms)",
-            [],
-        )
-        .context("Failed to create index on traffic_history_1d")?;
-
-        // 创建触发器自动清理旧数据
+        ensure_indexes(&conn)?;
         self.create_cleanup_triggers(&conn)?;
 
         Ok(())
     }
 
-    /// 创建自动清理触发器
     fn create_cleanup_triggers(&self, conn: &Connection) -> Result<()> {
-        // 原始数据保留5分钟
-        let retention_raw_ms = self.config.retention_raw_minutes as i64 * 60 * 1000;
-        conn.execute(
-            &format!(
-                "CREATE TRIGGER IF NOT EXISTS cleanup_raw_data
-                 AFTER INSERT ON traffic_history
-                 BEGIN
-                     DELETE FROM traffic_history
-                     WHERE timestamp_ms < (NEW.timestamp_ms - {});
-                 END",
-                retention_raw_ms
-            ),
-            [],
-        )
-        .context("Failed to create cleanup trigger for traffic_history")?;
+        for spec in TABLE_SPECS {
+            let retention_ms = spec.retention_ms(&self.config);
 
-        // 10秒聚合数据保留1小时
-        let retention_10s_ms = self.config.retention_10s_hours as i64 * 60 * 60 * 1000;
-        conn.execute(
-            &format!(
-                "CREATE TRIGGER IF NOT EXISTS cleanup_10s_data
-                 AFTER INSERT ON traffic_history_10s
+            conn.execute_batch(&format!(
+                "DROP TRIGGER IF EXISTS {trigger_name};
+                 CREATE TRIGGER {trigger_name}
+                 AFTER INSERT ON {table_name}
                  BEGIN
-                     DELETE FROM traffic_history_10s
-                     WHERE timestamp_ms < (NEW.timestamp_ms - {});
-                 END",
-                retention_10s_ms
-            ),
-            [],
-        )
-        .context("Failed to create cleanup trigger for traffic_history_10s")?;
-
-        // 1分钟聚合数据保留3小时
-        let retention_1m_ms = self.config.retention_1m_hours as i64 * 60 * 60 * 1000;
-        conn.execute(
-            &format!(
-                "CREATE TRIGGER IF NOT EXISTS cleanup_1m_data
-                 AFTER INSERT ON traffic_history_1m
-                 BEGIN
-                     DELETE FROM traffic_history_1m
-                     WHERE timestamp_ms < (NEW.timestamp_ms - {});
-                 END",
-                retention_1m_ms
-            ),
-            [],
-        )
-        .context("Failed to create cleanup trigger for traffic_history_1m")?;
-
-        // 1小时聚合数据保留7天
-        let retention_1h_ms = self.config.retention_1h_days as i64 * 24 * 60 * 60 * 1000;
-        conn.execute(
-            &format!(
-                "CREATE TRIGGER IF NOT EXISTS cleanup_1h_data
-                 AFTER INSERT ON traffic_history_1h
-                 BEGIN
-                     DELETE FROM traffic_history_1h
-                     WHERE timestamp_ms < (NEW.timestamp_ms - {});
-                 END",
-                retention_1h_ms
-            ),
-            [],
-        )
-        .context("Failed to create cleanup trigger for traffic_history_1h")?;
-
-        // 1天聚合数据保留30天
-        let retention_1d_ms = self.config.retention_1d_days as i64 * 24 * 60 * 60 * 1000;
-        conn.execute(
-            &format!(
-                "CREATE TRIGGER IF NOT EXISTS cleanup_1d_data
-                 AFTER INSERT ON traffic_history_1d
-                 BEGIN
-                     DELETE FROM traffic_history_1d
-                     WHERE timestamp_ms < (NEW.timestamp_ms - {});
-                 END",
-                retention_1d_ms
-            ),
-            [],
-        )
-        .context("Failed to create cleanup trigger for traffic_history_1d")?;
+                     DELETE FROM {table_name}
+                     WHERE timestamp_ms < (NEW.timestamp_ms - {retention_ms});
+                 END;",
+                trigger_name = spec.cleanup_trigger_name,
+                table_name = spec.name,
+                retention_ms = retention_ms,
+            ))
+            .with_context(|| format!("Failed to create cleanup trigger for {}", spec.name))?;
+        }
 
         Ok(())
     }
 
-    /// 插入一轮采集产生的所有数据
     pub fn insert_round_batch(
         &self,
         raw_data: &[TrafficData],
@@ -302,15 +206,15 @@ impl Database {
         Ok(())
     }
 
-    /// 获取当前数据（最新的数据）
     pub fn get_current_data(&self, namespace: &str) -> Result<Option<TrafficData>> {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn
             .prepare(
                 "SELECT data FROM traffic_history
-             WHERE namespace = ?1
-             ORDER BY timestamp_ms DESC LIMIT 1",
+                 WHERE namespace = ?1
+                 ORDER BY timestamp_ms DESC, id DESC
+                 LIMIT 1",
             )
             .context("Failed to prepare statement")?;
 
@@ -332,7 +236,6 @@ impl Database {
         }
     }
 
-    /// 根据持续时间获取历史数据
     pub fn get_history_by_duration(
         &self,
         namespace: &str,
@@ -341,26 +244,154 @@ impl Database {
         let now_ms = Utc::now().timestamp_millis();
         let since_ms = now_ms - (duration_minutes as i64 * 60 * 1000);
 
-        let table_name = if duration_minutes <= 5 {
-            "traffic_history"
-        } else if duration_minutes <= 60 {
-            "traffic_history_10s"
-        } else if duration_minutes <= 180 {
-            "traffic_history_1m"
-        } else if duration_minutes <= 1440 {
-            "traffic_history_1h"
-        } else {
-            "traffic_history_1d"
-        };
+        let table_name = table_name_for_duration(duration_minutes);
 
         let conn = self.conn.lock().unwrap();
-        query_data_range(
-            &conn,
-            table_name,
-            namespace,
-            since_ms,
-            now_ms,
+        query_data_range(&conn, table_name, namespace, since_ms, now_ms)
+    }
+}
+
+fn ensure_table_exists(conn: &Connection, spec: TableSpec) -> Result<()> {
+    conn.execute(&create_table_sql(spec.name, true), [])
+        .with_context(|| format!("Failed to create {} table", spec.name))?;
+    Ok(())
+}
+
+fn inspect_table(conn: &Connection, spec: TableSpec) -> Result<TableInspection> {
+    let mut has_created_at = false;
+    let mut table_info_stmt = conn
+        .prepare(&format!("PRAGMA table_info({})", spec.name))
+        .with_context(|| format!("Failed to inspect columns for {}", spec.name))?;
+
+    let table_info_rows = table_info_stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("Failed to query columns for {}", spec.name))?;
+
+    for column in table_info_rows {
+        if column.context("Failed to read table column")? == "created_at" {
+            has_created_at = true;
+        }
+    }
+
+    let mut has_unique_index = false;
+    let mut index_list_stmt = conn
+        .prepare(&format!("PRAGMA index_list({})", spec.name))
+        .with_context(|| format!("Failed to inspect indexes for {}", spec.name))?;
+
+    let index_rows = index_list_stmt
+        .query_map([], |row| row.get::<_, i64>(2))
+        .with_context(|| format!("Failed to query indexes for {}", spec.name))?;
+
+    for is_unique in index_rows {
+        if is_unique.context("Failed to read index metadata")? == 1 {
+            has_unique_index = true;
+        }
+    }
+
+    Ok(TableInspection {
+        has_created_at,
+        has_unique_index,
+    })
+}
+
+fn rebuild_table(conn: &mut Connection, spec: TableSpec, has_created_at: bool) -> Result<()> {
+    let temp_table_name = format!("{}_non_unique_migrating", spec.name);
+    let created_at_expr = if has_created_at {
+        "created_at"
+    } else {
+        "CURRENT_TIMESTAMP"
+    };
+
+    let tx = conn
+        .transaction()
+        .with_context(|| format!("Failed to start migration for {}", spec.name))?;
+
+    tx.execute_batch(&format!("DROP TABLE IF EXISTS {temp_table_name};"))
+        .with_context(|| format!("Failed to drop temp migration table for {}", spec.name))?;
+
+    tx.execute(&create_table_sql(&temp_table_name, false), [])
+        .with_context(|| format!("Failed to create temp migration table for {}", spec.name))?;
+
+    tx.execute(
+        &format!(
+            "INSERT INTO {temp_table_name} (id, namespace, timestamp, timestamp_ms, data, created_at)
+             SELECT id, namespace, timestamp, timestamp_ms, data, {created_at_expr}
+             FROM {table_name}
+             ORDER BY id",
+            temp_table_name = temp_table_name,
+            created_at_expr = created_at_expr,
+            table_name = spec.name,
+        ),
+        [],
+    )
+    .with_context(|| format!("Failed to copy legacy data for {}", spec.name))?;
+
+    tx.execute_batch(&format!(
+        "DROP TABLE {table_name};
+         ALTER TABLE {temp_table_name} RENAME TO {table_name};",
+        table_name = spec.name,
+        temp_table_name = temp_table_name,
+    ))
+    .with_context(|| format!("Failed to replace legacy table for {}", spec.name))?;
+
+    tx.commit()
+        .with_context(|| format!("Failed to commit migration for {}", spec.name))?;
+
+    Ok(())
+}
+
+fn ensure_indexes(conn: &Connection) -> Result<()> {
+    for spec in TABLE_SPECS {
+        conn.execute(
+            &format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {}(namespace, timestamp_ms)",
+                spec.query_index_name, spec.name
+            ),
+            [],
         )
+        .with_context(|| format!("Failed to create query index on {}", spec.name))?;
+
+        conn.execute(
+            &format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {}(timestamp_ms)",
+                spec.cleanup_index_name, spec.name
+            ),
+            [],
+        )
+        .with_context(|| format!("Failed to create cleanup index on {}", spec.name))?;
+    }
+
+    Ok(())
+}
+
+fn create_table_sql(table_name: &str, if_not_exists: bool) -> String {
+    let if_not_exists_clause = if if_not_exists { "IF NOT EXISTS " } else { "" };
+
+    format!(
+        "CREATE TABLE {if_not_exists_clause}{table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            namespace TEXT NOT NULL DEFAULT 'default',
+            timestamp TEXT NOT NULL,
+            timestamp_ms INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        if_not_exists_clause = if_not_exists_clause,
+        table_name = table_name,
+    )
+}
+
+fn table_name_for_duration(duration_minutes: u32) -> &'static str {
+    if duration_minutes <= 5 {
+        "traffic_history"
+    } else if duration_minutes <= 60 {
+        "traffic_history_10s"
+    } else if duration_minutes <= 180 {
+        "traffic_history_1m"
+    } else if duration_minutes <= 1440 {
+        "traffic_history_1h"
+    } else {
+        "traffic_history_1d"
     }
 }
 
@@ -388,15 +419,20 @@ fn insert_rows(
     }
 
     let sql = format!(
-        "INSERT OR REPLACE INTO {} (namespace, timestamp, timestamp_ms, data)
+        "INSERT INTO {} (namespace, timestamp, timestamp_ms, data)
          VALUES (?1, ?2, ?3, ?4)",
         table
     );
-    let mut stmt = tx.prepare(&sql).context("Failed to prepare batch insert")?;
+
+    let mut stmt = tx
+        .prepare_cached(&sql)
+        .with_context(|| format!("Failed to prepare statement for {}", table))?;
+
     for (namespace, timestamp, timestamp_ms, data_json) in payloads {
         stmt.execute(params![namespace, timestamp, timestamp_ms, data_json])
-            .with_context(|| format!("Failed to insert batch data into {}", table))?;
+            .with_context(|| format!("Failed to insert row into {}", table))?;
     }
+
     Ok(())
 }
 
@@ -411,7 +447,7 @@ fn query_data_range(
         .prepare(&format!(
             "SELECT data FROM {}
              WHERE namespace = ?1 AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
-             ORDER BY timestamp_ms ASC",
+             ORDER BY timestamp_ms ASC, id ASC",
             table
         ))
         .with_context(|| format!("Failed to prepare statement for table {}", table))?;
@@ -438,34 +474,64 @@ fn query_data_range(
     Ok(result)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn test_database_creation() {
-        let config = DatabaseConfig {
-            db_path: "data/test_creation.db".to_string(),
-            ..Default::default()
-        };
-        let db = Database::new(config);
-        assert!(db.is_ok());
+    fn temp_test_db_path(label: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+
+        std::env::temp_dir()
+            .join(format!("traffic-monitor-{label}-{nanos}.db"))
+            .to_string_lossy()
+            .into_owned()
     }
 
-    #[test]
-    fn test_insert_and_query() {
-        let config = DatabaseConfig {
-            db_path: "data/test.db".to_string(),
-            ..Default::default()
-        };
-        let db = Database::new(config).unwrap();
+    fn cleanup_test_db_files(db_path: &str) {
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(format!("{db_path}-wal"));
+        let _ = fs::remove_file(format!("{db_path}-shm"));
+    }
 
-        let data = TrafficData {
-            namespace: "test".to_string(),
+    fn has_index(conn: &Connection, table_name: &str, index_name: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA index_list({table_name})"))
+            .expect("failed to prepare index_list");
+
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("failed to query index_list");
+
+        for row in rows {
+            if row.expect("failed to read index name") == index_name {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn unique_index_count(conn: &Connection, table_name: &str) -> i64 {
+        conn.prepare(&format!("PRAGMA index_list({table_name})"))
+            .expect("failed to prepare index_list")
+            .query_map([], |row| row.get::<_, i64>(2))
+            .expect("failed to query index_list")
+            .map(|row| row.expect("failed to read unique flag"))
+            .filter(|flag| *flag == 1)
+            .count() as i64
+    }
+
+    fn build_test_data(namespace: &str, timestamp_ms: i64) -> TrafficData {
+        TrafficData {
+            namespace: namespace.to_string(),
             timestamp: "2024-01-01 00:00:00".to_string(),
-            timestamp_ms: 1704067200000,
+            timestamp_ms,
             interfaces: vec![InterfaceStats {
                 name: "eth0".to_string(),
                 rx_bytes: 1024,
@@ -478,13 +544,50 @@ mod tests {
                 tx_dropped_speed: Some(0),
             }],
             resolution: None,
+        }
+    }
+
+    #[test]
+    fn test_database_creation() {
+        let db_path = temp_test_db_path("creation");
+        cleanup_test_db_files(&db_path);
+
+        let config = DatabaseConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
         };
+
+        let db = Database::new(config).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        assert_eq!(unique_index_count(&conn, "traffic_history"), 0);
+        assert!(has_index(&conn, "traffic_history", "idx_history_namespace_ts"));
+        assert!(has_index(&conn, "traffic_history", "idx_history_timestamp_ms"));
+
+        drop(conn);
+        drop(db);
+        cleanup_test_db_files(&db_path);
+    }
+
+    #[test]
+    fn test_insert_and_query() {
+        let db_path = temp_test_db_path("insert-query");
+        cleanup_test_db_files(&db_path);
+
+        let config = DatabaseConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
+        };
+
+        let db = Database::new(config).unwrap();
+        let data = build_test_data("test", 1704067200000);
 
         db.insert_round_batch(std::slice::from_ref(&data), &[], &[], &[], &[])
             .unwrap();
 
         let result = db.get_current_data("test").unwrap();
         assert!(result.is_some());
+
         let result_data = result.unwrap();
         assert_eq!(result_data.namespace, data.namespace);
         assert_eq!(result_data.timestamp, data.timestamp);
@@ -493,5 +596,61 @@ mod tests {
         assert_eq!(result_data.interfaces[0].name, "eth0");
         assert_eq!(result_data.interfaces[0].rx_bytes, 1024);
         assert_eq!(result_data.interfaces[0].tx_bytes, 2048);
+
+        drop(db);
+        cleanup_test_db_files(&db_path);
+    }
+
+    #[test]
+    fn test_migrates_legacy_unique_schema() {
+        let db_path = temp_test_db_path("legacy-migration");
+        cleanup_test_db_files(&db_path);
+
+        let conn = Connection::open(PathBuf::from(&db_path)).unwrap();
+        conn.execute(
+            "CREATE TABLE traffic_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace TEXT NOT NULL DEFAULT 'default',
+                timestamp TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                data TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(namespace, timestamp_ms)
+            )",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = DatabaseConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
+        };
+
+        let db = Database::new(config).unwrap();
+        let data = build_test_data("legacy", 1704067200000);
+
+        db.insert_round_batch(std::slice::from_ref(&data), &[], &[], &[], &[])
+            .unwrap();
+        db.insert_round_batch(std::slice::from_ref(&data), &[], &[], &[], &[])
+            .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let duplicate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM traffic_history WHERE namespace = ?1 AND timestamp_ms = ?2",
+                params![data.namespace, data.timestamp_ms],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(duplicate_count, 2);
+        assert_eq!(unique_index_count(&conn, "traffic_history"), 0);
+        assert!(has_index(&conn, "traffic_history", "idx_history_namespace_ts"));
+        assert!(has_index(&conn, "traffic_history", "idx_history_timestamp_ms"));
+
+        drop(conn);
+        drop(db);
+        cleanup_test_db_files(&db_path);
     }
 }
