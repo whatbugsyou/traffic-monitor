@@ -132,28 +132,18 @@ impl Database {
         }
 
         ensure_indexes(&conn)?;
-        self.create_cleanup_triggers(&conn)?;
+        self.drop_legacy_cleanup_triggers(&conn)?;
 
         Ok(())
     }
 
-    fn create_cleanup_triggers(&self, conn: &Connection) -> Result<()> {
+    fn drop_legacy_cleanup_triggers(&self, conn: &Connection) -> Result<()> {
         for spec in TABLE_SPECS {
-            let retention_ms = spec.retention_ms(&self.config);
-
             conn.execute_batch(&format!(
-                "DROP TRIGGER IF EXISTS {trigger_name};
-                 CREATE TRIGGER {trigger_name}
-                 AFTER INSERT ON {table_name}
-                 BEGIN
-                     DELETE FROM {table_name}
-                     WHERE timestamp_ms < (NEW.timestamp_ms - {retention_ms});
-                 END;",
+                "DROP TRIGGER IF EXISTS {trigger_name};",
                 trigger_name = spec.cleanup_trigger_name,
-                table_name = spec.name,
-                retention_ms = retention_ms,
             ))
-            .with_context(|| format!("Failed to create cleanup trigger for {}", spec.name))?;
+            .with_context(|| format!("Failed to drop cleanup trigger for {}", spec.name))?;
         }
 
         Ok(())
@@ -204,6 +194,23 @@ impl Database {
         );
 
         Ok(())
+    }
+
+    pub(crate) fn cleanup_expired_data(&self, now_ms: i64) -> Result<usize> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .context("Failed to start cleanup transaction")?;
+
+        let mut deleted_rows = 0usize;
+        for spec in TABLE_SPECS {
+            deleted_rows +=
+                delete_expired_rows(&tx, spec.name, now_ms - spec.retention_ms(&self.config))?;
+        }
+
+        tx.commit()
+            .context("Failed to commit cleanup transaction")?;
+        Ok(deleted_rows)
     }
 
     pub fn get_current_data(&self, namespace: &str) -> Result<Option<TrafficData>> {
@@ -436,6 +443,18 @@ fn insert_rows(
     Ok(())
 }
 
+fn delete_expired_rows(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    cutoff_ms: i64,
+) -> Result<usize> {
+    tx.execute(
+        &format!("DELETE FROM {} WHERE timestamp_ms < ?1", table),
+        params![cutoff_ms],
+    )
+    .with_context(|| format!("Failed to cleanup expired rows from {}", table))
+}
+
 fn query_data_range(
     conn: &Connection,
     table: &str,
@@ -517,6 +536,18 @@ mod tests {
         false
     }
 
+    fn has_trigger(conn: &Connection, trigger_name: &str) -> bool {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1)",
+                params![trigger_name],
+                |row| row.get(0),
+            )
+            .expect("failed to query sqlite_master");
+
+        exists == 1
+    }
+
     fn unique_index_count(conn: &Connection, table_name: &str) -> i64 {
         conn.prepare(&format!("PRAGMA index_list({table_name})"))
             .expect("failed to prepare index_list")
@@ -561,8 +592,21 @@ mod tests {
         let conn = db.conn.lock().unwrap();
 
         assert_eq!(unique_index_count(&conn, "traffic_history"), 0);
-        assert!(has_index(&conn, "traffic_history", "idx_history_namespace_ts"));
-        assert!(has_index(&conn, "traffic_history", "idx_history_timestamp_ms"));
+        assert!(has_index(
+            &conn,
+            "traffic_history",
+            "idx_history_namespace_ts"
+        ));
+        assert!(has_index(
+            &conn,
+            "traffic_history",
+            "idx_history_timestamp_ms"
+        ));
+        assert!(!has_trigger(&conn, "cleanup_raw_data"));
+        assert!(!has_trigger(&conn, "cleanup_10s_data"));
+        assert!(!has_trigger(&conn, "cleanup_1m_data"));
+        assert!(!has_trigger(&conn, "cleanup_1h_data"));
+        assert!(!has_trigger(&conn, "cleanup_1d_data"));
 
         drop(conn);
         drop(db);
@@ -596,6 +640,80 @@ mod tests {
         assert_eq!(result_data.interfaces[0].name, "eth0");
         assert_eq!(result_data.interfaces[0].rx_bytes, 1024);
         assert_eq!(result_data.interfaces[0].tx_bytes, 2048);
+
+        drop(db);
+        cleanup_test_db_files(&db_path);
+    }
+
+    #[test]
+    fn test_drops_legacy_cleanup_triggers() {
+        let db_path = temp_test_db_path("drop-trigger");
+        cleanup_test_db_files(&db_path);
+
+        let conn = Connection::open(PathBuf::from(&db_path)).unwrap();
+        conn.execute(&create_table_sql("traffic_history", true), [])
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER cleanup_raw_data
+             AFTER INSERT ON traffic_history
+             BEGIN
+                 DELETE FROM traffic_history WHERE timestamp_ms < (NEW.timestamp_ms - 60000);
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = DatabaseConfig {
+            db_path: db_path.clone(),
+            ..Default::default()
+        };
+
+        let db = Database::new(config).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        assert!(!has_trigger(&conn, "cleanup_raw_data"));
+
+        drop(conn);
+        drop(db);
+        cleanup_test_db_files(&db_path);
+    }
+
+    #[test]
+    fn test_cleanup_expired_data() {
+        let db_path = temp_test_db_path("cleanup");
+        cleanup_test_db_files(&db_path);
+
+        let config = DatabaseConfig {
+            db_path: db_path.clone(),
+            retention_raw_minutes: 1,
+            ..Default::default()
+        };
+
+        let db = Database::new(config).unwrap();
+        let expired = build_test_data("cleanup", 0);
+        let retained = build_test_data("cleanup", 60_000);
+
+        db.insert_round_batch(std::slice::from_ref(&expired), &[], &[], &[], &[])
+            .unwrap();
+        db.insert_round_batch(std::slice::from_ref(&retained), &[], &[], &[], &[])
+            .unwrap();
+
+        let deleted = db.cleanup_expired_data(120_000).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let remaining_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM traffic_history WHERE namespace = ?1",
+                params![retained.namespace.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        assert_eq!(remaining_count, 1);
+        drop(conn);
+
+        let current = db.get_current_data("cleanup").unwrap().unwrap();
+        assert_eq!(current.timestamp_ms, retained.timestamp_ms);
 
         drop(db);
         cleanup_test_db_files(&db_path);
@@ -646,8 +764,16 @@ mod tests {
 
         assert_eq!(duplicate_count, 2);
         assert_eq!(unique_index_count(&conn, "traffic_history"), 0);
-        assert!(has_index(&conn, "traffic_history", "idx_history_namespace_ts"));
-        assert!(has_index(&conn, "traffic_history", "idx_history_timestamp_ms"));
+        assert!(has_index(
+            &conn,
+            "traffic_history",
+            "idx_history_namespace_ts"
+        ));
+        assert!(has_index(
+            &conn,
+            "traffic_history",
+            "idx_history_timestamp_ms"
+        ));
 
         drop(conn);
         drop(db);

@@ -19,7 +19,7 @@ const INTERVAL_1M: i64 = 60_000; // 1分钟（毫秒）
 const INTERVAL_1H: i64 = 3_600_000; // 1小时（毫秒）
 const INTERVAL_1D: i64 = 86_400_000; // 1天（毫秒）
 const MAX_NAMESPACE_CONCURRENCY: usize = 20;
-
+const CLEANUP_INTERVAL_SECS: u64 = 30;
 
 /// 每个命名空间的多粒度广播通道
 struct ResolutionChannels {
@@ -187,6 +187,10 @@ impl TrafficCollector {
             let mut collect_interval = interval(Duration::from_secs(config.interval_secs));
             collect_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+            let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
+            cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            cleanup_interval.tick().await;
+
             log::info!("Started collection scheduler");
 
             loop {
@@ -279,6 +283,22 @@ impl TrafficCollector {
                             namespace_count,
                             failures
                         );
+                    }
+                    _ = cleanup_interval.tick() => {
+                        let cleanup_started_at = Instant::now();
+                        match db.cleanup_expired_data(Utc::now().timestamp_millis()) {
+                            Ok(deleted_rows) if deleted_rows > 0 => {
+                                log::debug!(
+                                    "Cleaned up {} expired rows in {} ms",
+                                    deleted_rows,
+                                    cleanup_started_at.elapsed().as_millis()
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                log::error!("Failed to cleanup expired data: {}", e);
+                            }
+                        }
                     }
                     _ = shutdown_rx.recv() => {
                         log::info!("Collection scheduler stopped");
@@ -389,9 +409,7 @@ fn scan_namespaces() -> Result<Vec<String>> {
     Ok(namespaces)
 }
 
-async fn collect_namespace_round(
-    namespaces: &[String],
-) -> Vec<(String, Result<TrafficData>)> {
+async fn collect_namespace_round(namespaces: &[String]) -> Vec<(String, Result<TrafficData>)> {
     let mut results = Vec::with_capacity(namespaces.len());
     let semaphore = Arc::new(Semaphore::new(MAX_NAMESPACE_CONCURRENCY));
     let mut join_set = JoinSet::new();
@@ -572,5 +590,4 @@ veth1234@if5: 700 7 0 0 0 0 0 0 800 8 0 0 0 0 0 0
         assert_eq!(interfaces[1].name, "eth0.1");
         assert_eq!(interfaces[2].name, "veth1234@if5");
     }
-
 }
