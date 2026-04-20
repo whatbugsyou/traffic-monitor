@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::models::*;
 
+static IN_MEMORY_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug)]
 pub struct Database {
-    conn: Arc<Mutex<Connection>>,
+    writer_conn: Arc<Mutex<Connection>>,
+    reader_conn: Arc<Mutex<Connection>>,
     config: DatabaseConfig,
 }
 
@@ -89,38 +93,43 @@ impl TableSpec {
 
 impl Database {
     pub fn new(config: DatabaseConfig) -> Result<Self> {
-        let db_path = Path::new(&config.db_path);
+        if config.db_path != ":memory:" {
+            let db_path = Path::new(&config.db_path);
 
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create database directory: {:?}", parent))?;
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create database directory: {:?}", parent)
+                })?;
+            }
         }
 
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("Failed to open database: {}", config.db_path))?;
+        let target = resolve_connection_target(&config.db_path);
 
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA temp_store = MEMORY;
-            PRAGMA cache_size = -64000;
-            PRAGMA busy_timeout = 5000;
-            ",
-        )
-        .context("Failed to apply SQLite pragmas")?;
+        let writer_conn = open_connection(&target)
+            .with_context(|| format!("Failed to open writer database: {}", config.db_path))?;
+        apply_connection_pragmas(&writer_conn).context("Failed to apply writer SQLite pragmas")?;
 
         let db = Database {
-            conn: Arc::new(Mutex::new(conn)),
+            writer_conn: Arc::new(Mutex::new(writer_conn)),
+            reader_conn: Arc::new(Mutex::new(open_connection(&target).with_context(|| {
+                format!("Failed to open reader database: {}", config.db_path)
+            })?)),
             config,
         };
 
         db.initialize()?;
+
+        {
+            let reader_conn = db.reader_conn.lock().unwrap();
+            apply_connection_pragmas(&reader_conn)
+                .context("Failed to apply reader SQLite pragmas")?;
+        }
+
         Ok(db)
     }
 
     fn initialize(&self) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.writer_conn.lock().unwrap();
 
         for spec in TABLE_SPECS {
             ensure_table_exists(&conn, spec)?;
@@ -158,7 +167,7 @@ impl Database {
         data_1d: &[TrafficData],
     ) -> Result<()> {
         let started_at = Instant::now();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.writer_conn.lock().unwrap();
         let lock_elapsed_ms = started_at.elapsed().as_millis();
 
         let serialize_started_at = Instant::now();
@@ -197,7 +206,7 @@ impl Database {
     }
 
     pub(crate) fn cleanup_expired_data(&self, now_ms: i64) -> Result<usize> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.writer_conn.lock().unwrap();
         let tx = conn
             .transaction()
             .context("Failed to start cleanup transaction")?;
@@ -214,7 +223,7 @@ impl Database {
     }
 
     pub fn get_current_data(&self, namespace: &str) -> Result<Option<TrafficData>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader_conn.lock().unwrap();
 
         let mut stmt = conn
             .prepare(
@@ -253,9 +262,43 @@ impl Database {
 
         let table_name = table_name_for_duration(duration_minutes);
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader_conn.lock().unwrap();
         query_data_range(&conn, table_name, namespace, since_ms, now_ms)
     }
+}
+
+fn resolve_connection_target(db_path: &str) -> String {
+    if db_path == ":memory:" {
+        let id = IN_MEMORY_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("file:traffic-monitor-memory-{id}?mode=memory&cache=shared")
+    } else {
+        db_path.to_string()
+    }
+}
+
+fn open_connection(target: &str) -> Result<Connection> {
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+    if target.starts_with("file:") {
+        flags |= OpenFlags::SQLITE_OPEN_URI;
+    }
+
+    Connection::open_with_flags(target, flags)
+        .with_context(|| format!("Failed to open database connection: {}", target))
+}
+
+fn apply_connection_pragmas(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_size = -64000;
+        PRAGMA busy_timeout = 5000;
+        ",
+    )
+    .context("Failed to apply SQLite pragmas")?;
+
+    Ok(())
 }
 
 fn ensure_table_exists(conn: &Connection, spec: TableSpec) -> Result<()> {
@@ -589,7 +632,7 @@ mod tests {
         };
 
         let db = Database::new(config).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.writer_conn.lock().unwrap();
 
         assert_eq!(unique_index_count(&conn, "traffic_history"), 0);
         assert!(has_index(
@@ -669,7 +712,7 @@ mod tests {
         };
 
         let db = Database::new(config).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.writer_conn.lock().unwrap();
 
         assert!(!has_trigger(&conn, "cleanup_raw_data"));
 
@@ -699,7 +742,7 @@ mod tests {
             .unwrap();
 
         let deleted = db.cleanup_expired_data(120_000).unwrap();
-        let conn = db.conn.lock().unwrap();
+        let conn = db.reader_conn.lock().unwrap();
         let remaining_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM traffic_history WHERE namespace = ?1",
@@ -753,7 +796,7 @@ mod tests {
         db.insert_round_batch(std::slice::from_ref(&data), &[], &[], &[], &[])
             .unwrap();
 
-        let conn = db.conn.lock().unwrap();
+        let conn = db.writer_conn.lock().unwrap();
         let duplicate_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM traffic_history WHERE namespace = ?1 AND timestamp_ms = ?2",
