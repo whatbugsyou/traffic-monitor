@@ -39,7 +39,9 @@ impl HttpServerWrapper {
         log::info!("API endpoints:");
         log::info!("  GET /api/namespaces                      - List namespaces");
         log::info!("  GET /api/current?namespace=<ns>          - Current data");
-        log::info!("  GET /api/history?namespace=<ns>&duration=<min>&resolution=<res> - Historical data");
+        log::info!(
+            "  GET /api/history?namespace=<ns>&duration=<min>&resolution=<res> - Historical data"
+        );
         log::info!("  GET /api/stream?namespace=<ns>&duration=<min>&resolution=<res> - SSE real-time stream");
 
         let server = HttpServer::new(move || {
@@ -174,7 +176,10 @@ async fn sse_stream(
     // 从数据库获取最近一条数据作为 prev_data 的初始值
     let initial_data = db.get_current_data(&namespace).ok().flatten();
     if initial_data.is_some() {
-        log::debug!("SSE stream initialized with previous data for namespace: {}", namespace);
+        log::debug!(
+            "SSE stream initialized with previous data for namespace: {}",
+            namespace
+        );
     }
 
     // 创建 SSE 流（精准订阅，计算速度后发送）
@@ -248,27 +253,56 @@ struct StreamQuery {
 mod tests {
     use super::*;
     use actix_web::test;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::collector::TrafficCollector;
 
+    fn temp_test_db_path(label: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+
+        std::env::temp_dir()
+            .join(format!("traffic-monitor-{label}-{nanos}.db"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn cleanup_test_db_files(db_path: &str) {
+        let _ = fs::remove_file(db_path);
+        let _ = fs::remove_file(format!("{db_path}-wal"));
+        let _ = fs::remove_file(format!("{db_path}-shm"));
+    }
+
     #[actix_rt::test]
     async fn test_get_namespaces() {
-        let config = DatabaseConfig::default();
-        let db = Arc::new(Database::new(config).unwrap());
+        let db_path = temp_test_db_path("server-test-get-namespaces");
 
-        let collector = Arc::new(
-            TrafficCollector::new(Arc::clone(&db), CollectorConfig::default()).unwrap(),
-        );
+        {
+            let config = DatabaseConfig {
+                db_path: db_path.clone(),
+                ..DatabaseConfig::default()
+            };
+            let db = Arc::new(Database::new(config).unwrap());
 
-        let app = App::new()
-            .app_data(web::Data::new(db))
-            .app_data(web::Data::new(collector))
-            .route("/api/namespaces", web::get().to(get_namespaces));
+            let collector = Arc::new(
+                TrafficCollector::new(Arc::clone(&db), CollectorConfig::default()).unwrap(),
+            );
 
-        let mut app = test::init_service(app).await;
-        let req = test::TestRequest::get().uri("/api/namespaces").to_request();
+            let app = App::new()
+                .app_data(web::Data::new(db))
+                .app_data(web::Data::new(collector))
+                .route("/api/namespaces", web::get().to(get_namespaces));
 
-        let resp = test::call_service(&mut app, req).await;
-        assert!(resp.status().is_success());
+            let mut app = test::init_service(app).await;
+            let req = test::TestRequest::get().uri("/api/namespaces").to_request();
+
+            let resp = test::call_service(&mut app, req).await;
+            assert!(resp.status().is_success());
+        }
+
+        cleanup_test_db_files(&db_path);
     }
 }
