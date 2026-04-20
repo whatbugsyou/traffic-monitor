@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -20,8 +20,10 @@ const INTERVAL_1H: i64 = 3_600_000; // 1小时（毫秒）
 const INTERVAL_1D: i64 = 86_400_000; // 1天（毫秒）
 const MAX_NAMESPACE_CONCURRENCY: usize = 20;
 const CLEANUP_INTERVAL_SECS: u64 = 30;
+const STORAGE_CHANNEL_CAPACITY: usize = 32;
 
 /// 每个命名空间的多粒度广播通道
+#[derive(Clone)]
 struct ResolutionChannels {
     /// 实时数据通道（1秒粒度）
     realtime: broadcast::Sender<TrafficData>,
@@ -64,6 +66,93 @@ impl ResolutionChannels {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct NamespaceAggregationState {
+    last_10s_ts: Option<i64>,
+    last_1m_ts: Option<i64>,
+    last_1h_ts: Option<i64>,
+    last_1d_ts: Option<i64>,
+}
+
+#[derive(Debug)]
+struct RoundBatch {
+    raw_data: Vec<TrafficData>,
+    data_10s: Vec<TrafficData>,
+    data_1m: Vec<TrafficData>,
+    data_1h: Vec<TrafficData>,
+    data_1d: Vec<TrafficData>,
+}
+
+enum StorageCommand {
+    PersistRound(RoundBatch),
+}
+
+struct CollectionProgressGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl CollectionProgressGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+}
+
+impl Drop for CollectionProgressGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Default)]
+struct TaskLifecycle {
+    active_tasks: StdMutex<usize>,
+    stopped: Condvar,
+}
+
+impl TaskLifecycle {
+    fn register(&self) {
+        let mut active_tasks = self.active_tasks.lock().unwrap();
+        *active_tasks += 1;
+    }
+
+    fn finish(&self) {
+        let mut active_tasks = self.active_tasks.lock().unwrap();
+
+        if *active_tasks == 0 {
+            return;
+        }
+
+        *active_tasks -= 1;
+        if *active_tasks == 0 {
+            self.stopped.notify_all();
+        }
+    }
+
+    fn wait_for_stop(&self) {
+        let mut active_tasks = self.active_tasks.lock().unwrap();
+
+        while *active_tasks > 0 {
+            active_tasks = self.stopped.wait(active_tasks).unwrap();
+        }
+    }
+}
+
+struct TaskGuard {
+    lifecycle: Arc<TaskLifecycle>,
+}
+
+impl TaskGuard {
+    fn new(lifecycle: Arc<TaskLifecycle>) -> Self {
+        Self { lifecycle }
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.lifecycle.finish();
+    }
+}
+
 /// 流量数据采集器
 pub struct TrafficCollector {
     db: Arc<Database>,
@@ -73,6 +162,8 @@ pub struct TrafficCollector {
     channels: Arc<RwLock<HashMap<String, ResolutionChannels>>>,
     aggregation_state: Arc<RwLock<HashMap<String, NamespaceAggregationState>>>,
     collection_in_progress: Arc<AtomicBool>,
+    shutdown_started: Arc<AtomicBool>,
+    task_lifecycle: Arc<TaskLifecycle>,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -84,6 +175,8 @@ impl TrafficCollector {
         let channels = Arc::new(RwLock::new(HashMap::new()));
         let aggregation_state = Arc::new(RwLock::new(HashMap::new()));
         let collection_in_progress = Arc::new(AtomicBool::new(false));
+        let shutdown_started = Arc::new(AtomicBool::new(false));
+        let task_lifecycle = Arc::new(TaskLifecycle::default());
 
         Ok(TrafficCollector {
             db,
@@ -92,6 +185,8 @@ impl TrafficCollector {
             channels,
             aggregation_state,
             collection_in_progress,
+            shutdown_started,
+            task_lifecycle,
             shutdown,
         })
     }
@@ -99,9 +194,13 @@ impl TrafficCollector {
     /// 启动采集器
     pub async fn start(&self) -> Result<()> {
         self.discover_namespaces().await?;
-        self.ensure_namespace_runtime_state().await;
-        self.start_collection_scheduler().await?;
+
+        let (storage_tx, storage_rx) = mpsc::channel(STORAGE_CHANNEL_CAPACITY);
+
+        self.start_storage_worker(storage_rx).await?;
+        self.start_collection_scheduler(storage_tx).await?;
         self.start_namespace_discovery().await?;
+
         Ok(())
     }
 
@@ -109,14 +208,14 @@ impl TrafficCollector {
     async fn discover_namespaces(&self) -> Result<()> {
         let namespaces = scan_namespaces()?;
 
-        let mut ns_guard = self.namespaces.write().await;
-        if *ns_guard != namespaces {
-            log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, namespaces);
+        {
+            let mut ns_guard = self.namespaces.write().await;
+            if *ns_guard != namespaces {
+                log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, namespaces);
+            }
+            *ns_guard = namespaces.clone();
+            log::info!("Discovered {} namespaces", ns_guard.len());
         }
-        *ns_guard = namespaces;
-
-        log::info!("Discovered {} namespaces", ns_guard.len());
-        drop(ns_guard);
 
         self.ensure_namespace_runtime_state().await;
         Ok(())
@@ -127,9 +226,13 @@ impl TrafficCollector {
         let namespaces = Arc::clone(&self.namespaces);
         let channels = Arc::clone(&self.channels);
         let aggregation_state = Arc::clone(&self.aggregation_state);
+        let task_lifecycle = Arc::clone(&self.task_lifecycle);
         let mut shutdown_rx = self.shutdown.subscribe();
 
+        task_lifecycle.register();
+
         tokio::spawn(async move {
+            let _task_guard = TaskGuard::new(task_lifecycle);
             let mut check_interval = interval(Duration::from_secs(60));
             check_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -142,17 +245,13 @@ impl TrafficCollector {
                                 if *ns_guard != new_namespaces {
                                     log::info!("Namespaces changed: {:?} -> {:?}", *ns_guard, new_namespaces);
 
-
-
                                     let mut ch = channels.write().await;
                                     let mut agg = aggregation_state.write().await;
-                                    for namespace in &new_namespaces {
-                                        if !ch.contains_key(namespace) {
-                                            ch.insert(namespace.clone(), ResolutionChannels::new());
-                                            log::info!("Created channels for new namespace: {}", namespace);
-                                        }
-                                        agg.entry(namespace.clone()).or_insert_with(NamespaceAggregationState::default);
-                                    }
+                                    reconcile_namespace_runtime_state(
+                                        &new_namespaces,
+                                        &mut ch,
+                                        &mut agg,
+                                    );
 
                                     *ns_guard = new_namespaces;
                                 }
@@ -174,22 +273,24 @@ impl TrafficCollector {
     }
 
     /// 启动统一采集调度任务
-    async fn start_collection_scheduler(&self) -> Result<()> {
-        let db = Arc::clone(&self.db);
+    async fn start_collection_scheduler(
+        &self,
+        storage_tx: mpsc::Sender<StorageCommand>,
+    ) -> Result<()> {
         let channels = Arc::clone(&self.channels);
         let namespaces = Arc::clone(&self.namespaces);
         let aggregation_state = Arc::clone(&self.aggregation_state);
         let collection_in_progress = Arc::clone(&self.collection_in_progress);
+        let task_lifecycle = Arc::clone(&self.task_lifecycle);
         let mut shutdown_rx = self.shutdown.subscribe();
         let config = self.config.clone();
 
+        task_lifecycle.register();
+
         tokio::spawn(async move {
+            let _task_guard = TaskGuard::new(task_lifecycle);
             let mut collect_interval = interval(Duration::from_secs(config.interval_secs));
             collect_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
-            cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            cleanup_interval.tick().await;
 
             log::info!("Started collection scheduler");
 
@@ -207,57 +308,97 @@ impl TrafficCollector {
 
                         let results = collect_namespace_round(&namespaces_snapshot).await;
 
-                        let mut raw_data: Vec<TrafficData> = Vec::new();
-                        let mut data_10s: Vec<TrafficData> = Vec::new();
-                        let mut data_1m: Vec<TrafficData> = Vec::new();
-                        let mut data_1h: Vec<TrafficData> = Vec::new();
-                        let mut data_1d: Vec<TrafficData> = Vec::new();
+                        let mut batch = RoundBatch {
+                            raw_data: Vec::new(),
+                            data_10s: Vec::new(),
+                            data_1m: Vec::new(),
+                            data_1h: Vec::new(),
+                            data_1d: Vec::new(),
+                        };
                         let mut namespace_count = 0usize;
                         let mut failures = 0usize;
 
                         for (namespace, result) in results {
                             match result {
-                                Ok(mut data) => {
+                                Ok(data) => {
                                     namespace_count += 1;
+
+                                    let Some(namespace_channels) = ({
+                                        let channels_guard = channels.read().await;
+                                        channels_guard.get(&namespace).cloned()
+                                    }) else {
+                                        log::debug!(
+                                            "Skipping collected data for removed namespace: {}",
+                                            namespace
+                                        );
+                                        continue;
+                                    };
+
                                     let timestamp_ms = data.timestamp_ms;
+                                    let mut emit_10s = false;
+                                    let mut emit_1m = false;
+                                    let mut emit_1h = false;
+                                    let mut emit_1d = false;
 
-                                    let mut state_guard = aggregation_state.write().await;
-                                    let state = state_guard
-                                        .entry(namespace.clone())
-                                        .or_insert_with(NamespaceAggregationState::default);
-
-                                    let channels_guard = channels.read().await;
-                                    if let Some(namespace_channels) = channels_guard.get(&namespace) {
-                                        data.resolution = Some(Resolution::Realtime.as_str().to_string());
-                                        let _ = namespace_channels.realtime.send(data.clone());
+                                    {
+                                        let mut state_guard = aggregation_state.write().await;
+                                        let Some(state) = state_guard.get_mut(&namespace) else {
+                                            log::debug!(
+                                                "Aggregation state missing for namespace: {}",
+                                                namespace
+                                            );
+                                            continue;
+                                        };
 
                                         if should_aggregate(timestamp_ms, state.last_10s_ts, INTERVAL_10S) {
                                             state.last_10s_ts = Some(align_timestamp(timestamp_ms, INTERVAL_10S));
-                                            data.resolution = Some(Resolution::TenSeconds.as_str().to_string());
-                                            data_10s.push(data.clone());
-                                            let _ = namespace_channels.agg_10s.send(data.clone());
+                                            emit_10s = true;
                                         }
 
                                         if should_aggregate(timestamp_ms, state.last_1m_ts, INTERVAL_1M) {
                                             state.last_1m_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1M));
-                                            data.resolution = Some(Resolution::OneMinute.as_str().to_string());
-                                            data_1m.push(data.clone());
-                                            let _ = namespace_channels.agg_1m.send(data.clone());
+                                            emit_1m = true;
                                         }
 
                                         if should_aggregate(timestamp_ms, state.last_1h_ts, INTERVAL_1H) {
                                             state.last_1h_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1H));
-                                            data.resolution = Some(Resolution::OneHour.as_str().to_string());
-                                            data_1h.push(data.clone());
-                                            let _ = namespace_channels.agg_1h.send(data.clone());
+                                            emit_1h = true;
                                         }
 
                                         if should_aggregate(timestamp_ms, state.last_1d_ts, INTERVAL_1D) {
                                             state.last_1d_ts = Some(align_timestamp(timestamp_ms, INTERVAL_1D));
-                                            data_1d.push(data.clone());
+                                            emit_1d = true;
                                         }
+                                    }
 
-                                        raw_data.push(data);
+                                    let realtime_data =
+                                        build_resolution_data(&data, Resolution::Realtime.as_str());
+                                    let _ = namespace_channels.realtime.send(realtime_data.clone());
+                                    batch.raw_data.push(realtime_data);
+
+                                    if emit_10s {
+                                        let data_10s =
+                                            build_resolution_data(&data, Resolution::TenSeconds.as_str());
+                                        let _ = namespace_channels.agg_10s.send(data_10s.clone());
+                                        batch.data_10s.push(data_10s);
+                                    }
+
+                                    if emit_1m {
+                                        let data_1m =
+                                            build_resolution_data(&data, Resolution::OneMinute.as_str());
+                                        let _ = namespace_channels.agg_1m.send(data_1m.clone());
+                                        batch.data_1m.push(data_1m);
+                                    }
+
+                                    if emit_1h {
+                                        let data_1h =
+                                            build_resolution_data(&data, Resolution::OneHour.as_str());
+                                        let _ = namespace_channels.agg_1h.send(data_1h.clone());
+                                        batch.data_1h.push(data_1h);
+                                    }
+
+                                    if emit_1d {
+                                        batch.data_1d.push(build_resolution_data(&data, "1d"));
                                     }
                                 }
                                 Err(e) => {
@@ -267,14 +408,10 @@ impl TrafficCollector {
                             }
                         }
 
-                        if let Err(e) = db.insert_round_batch(
-                            &raw_data,
-                            &data_10s,
-                            &data_1m,
-                            &data_1h,
-                            &data_1d,
-                        ) {
-                            log::error!("Failed to store round batch data: {}", e);
+                        if !round_batch_is_empty(&batch) {
+                            if let Err(e) = storage_tx.send(StorageCommand::PersistRound(batch)).await {
+                                log::error!("Failed to enqueue round batch for storage: {}", e);
+                            }
                         }
 
                         log::info!(
@@ -283,6 +420,52 @@ impl TrafficCollector {
                             namespace_count,
                             failures
                         );
+                    }
+                    _ = shutdown_rx.recv() => {
+                        log::info!("Collection scheduler stopped");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// 启动独立的存储任务，串行执行数据库写入和清理。
+    /// 该任务不直接监听 shutdown，而是在所有发送端释放后继续消费队列，
+    /// 直到 channel 关闭为止，确保退出过程中不会丢失已投递但尚未落库的数据。
+    async fn start_storage_worker(
+        &self,
+        mut storage_rx: mpsc::Receiver<StorageCommand>,
+    ) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        let task_lifecycle = Arc::clone(&self.task_lifecycle);
+
+        task_lifecycle.register();
+
+        tokio::spawn(async move {
+            let _task_guard = TaskGuard::new(task_lifecycle);
+            let mut cleanup_interval = interval(Duration::from_secs(CLEANUP_INTERVAL_SECS));
+            cleanup_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            cleanup_interval.tick().await;
+
+            log::info!("Started storage worker");
+
+            loop {
+                tokio::select! {
+                    command = storage_rx.recv() => {
+                        match command {
+                            Some(StorageCommand::PersistRound(batch)) => {
+                                if let Err(e) = persist_round_batch(&db, batch) {
+                                    log::error!("Failed to persist round batch: {}", e);
+                                }
+                            }
+                            None => {
+                                log::info!("Storage channel closed, storage worker drained all pending writes");
+                                break;
+                            }
+                        }
                     }
                     _ = cleanup_interval.tick() => {
                         let cleanup_started_at = Instant::now();
@@ -300,12 +483,10 @@ impl TrafficCollector {
                             }
                         }
                     }
-                    _ = shutdown_rx.recv() => {
-                        log::info!("Collection scheduler stopped");
-                        break;
-                    }
                 }
             }
+
+            log::info!("Storage worker stopped");
         });
 
         Ok(())
@@ -316,18 +497,7 @@ impl TrafficCollector {
         let mut channels = self.channels.write().await;
         let mut aggregation_state = self.aggregation_state.write().await;
 
-        for namespace in namespaces.iter() {
-            if !channels.contains_key(namespace) {
-                channels.insert(namespace.clone(), ResolutionChannels::new());
-                log::info!(
-                    "Created multi-resolution channels for namespace: {}",
-                    namespace
-                );
-            }
-            aggregation_state
-                .entry(namespace.clone())
-                .or_insert_with(NamespaceAggregationState::default);
-        }
+        reconcile_namespace_runtime_state(&namespaces, &mut channels, &mut aggregation_state);
     }
 
     /// 订阅特定命名空间和分辨率的数据（精准订阅）
@@ -355,37 +525,122 @@ impl TrafficCollector {
         self.namespaces.read().await.clone()
     }
 
-    /// 停止采集器
-    pub fn stop(&self) -> Result<()> {
-        self.shutdown
-            .send(())
-            .context("Failed to send shutdown signal")?;
+    /// 异步优雅停止采集器。
+    /// 异步上下文应优先使用该接口，避免阻塞运行时线程。
+    pub async fn shutdown(&self) -> Result<()> {
+        self.initiate_shutdown();
+
+        let task_lifecycle = Arc::clone(&self.task_lifecycle);
+        tokio::task::spawn_blocking(move || {
+            task_lifecycle.wait_for_stop();
+        })
+        .await
+        .context("Failed to wait for collector shutdown")?;
+
         Ok(())
     }
-}
 
-#[derive(Debug, Default, Clone)]
-struct NamespaceAggregationState {
-    last_10s_ts: Option<i64>,
-    last_1m_ts: Option<i64>,
-    last_1h_ts: Option<i64>,
-    last_1d_ts: Option<i64>,
-}
+    /// 兼容现有调用方式的同步停止接口。
+    /// 新代码应优先使用 `shutdown().await`。
+    #[allow(dead_code)]
+    pub fn stop(&self) -> Result<()> {
+        self.initiate_shutdown();
+        self.task_lifecycle.wait_for_stop();
+        Ok(())
+    }
 
-struct CollectionProgressGuard {
-    flag: Arc<AtomicBool>,
-}
+    fn initiate_shutdown(&self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
 
-impl CollectionProgressGuard {
-    fn new(flag: Arc<AtomicBool>) -> Self {
-        Self { flag }
+        if let Err(error) = self.shutdown.send(()) {
+            log::warn!(
+                "Failed to send shutdown signal, waiting for background tasks anyway: {}",
+                error
+            );
+        }
     }
 }
 
-impl Drop for CollectionProgressGuard {
-    fn drop(&mut self) {
-        self.flag.store(false, Ordering::Release);
+fn reconcile_namespace_runtime_state(
+    namespaces: &[String],
+    channels: &mut HashMap<String, ResolutionChannels>,
+    aggregation_state: &mut HashMap<String, NamespaceAggregationState>,
+) {
+    let namespace_set: HashSet<String> = namespaces.iter().cloned().collect();
+    let stale_namespaces: HashSet<String> = channels
+        .keys()
+        .chain(aggregation_state.keys())
+        .filter(|namespace| !namespace_set.contains(*namespace))
+        .cloned()
+        .collect();
+
+    for namespace in &stale_namespaces {
+        log::info!("Removed runtime state for stale namespace: {}", namespace);
     }
+
+    channels.retain(|namespace, _| namespace_set.contains(namespace));
+    aggregation_state.retain(|namespace, _| namespace_set.contains(namespace));
+
+    for namespace in namespaces {
+        if !channels.contains_key(namespace) {
+            channels.insert(namespace.clone(), ResolutionChannels::new());
+            log::info!(
+                "Created multi-resolution channels for namespace: {}",
+                namespace
+            );
+        }
+
+        aggregation_state
+            .entry(namespace.clone())
+            .or_insert_with(NamespaceAggregationState::default);
+    }
+}
+
+fn build_resolution_data(source: &TrafficData, resolution: &str) -> TrafficData {
+    let mut data = source.clone();
+    data.resolution = Some(resolution.to_string());
+    data
+}
+
+fn round_batch_is_empty(batch: &RoundBatch) -> bool {
+    batch.raw_data.is_empty()
+        && batch.data_10s.is_empty()
+        && batch.data_1m.is_empty()
+        && batch.data_1h.is_empty()
+        && batch.data_1d.is_empty()
+}
+
+fn persist_round_batch(db: &Database, batch: RoundBatch) -> Result<()> {
+    let started_at = Instant::now();
+
+    let raw_count = batch.raw_data.len();
+    let count_10s = batch.data_10s.len();
+    let count_1m = batch.data_1m.len();
+    let count_1h = batch.data_1h.len();
+    let count_1d = batch.data_1d.len();
+
+    db.insert_round_batch(
+        &batch.raw_data,
+        &batch.data_10s,
+        &batch.data_1m,
+        &batch.data_1h,
+        &batch.data_1d,
+    )
+    .context("Failed to store round batch data")?;
+
+    log::debug!(
+        "Storage timing [round] persisted in {} ms raw={} 10s={} 1m={} 1h={} 1d={}",
+        started_at.elapsed().as_millis(),
+        raw_count,
+        count_10s,
+        count_1m,
+        count_1h,
+        count_1d
+    );
+
+    Ok(())
 }
 
 fn scan_namespaces() -> Result<Vec<String>> {
@@ -565,6 +820,46 @@ mod tests {
         assert!(!should_aggregate(15000, Some(10000), INTERVAL_10S));
         assert!(should_aggregate(20000, Some(10000), INTERVAL_10S));
         assert!(should_aggregate(25000, Some(10000), INTERVAL_10S));
+    }
+
+    #[test]
+    fn test_reconcile_namespace_runtime_state_removes_stale_namespaces() {
+        let mut channels = std::collections::HashMap::new();
+        channels.insert("default".to_string(), ResolutionChannels::new());
+        channels.insert("stale".to_string(), ResolutionChannels::new());
+
+        let mut aggregation_state = std::collections::HashMap::new();
+        aggregation_state.insert("default".to_string(), NamespaceAggregationState::default());
+        aggregation_state.insert("stale".to_string(), NamespaceAggregationState::default());
+
+        let namespaces = vec!["default".to_string(), "new".to_string()];
+
+        reconcile_namespace_runtime_state(&namespaces, &mut channels, &mut aggregation_state);
+
+        assert!(channels.contains_key("default"));
+        assert!(channels.contains_key("new"));
+        assert!(!channels.contains_key("stale"));
+
+        assert!(aggregation_state.contains_key("default"));
+        assert!(aggregation_state.contains_key("new"));
+        assert!(!aggregation_state.contains_key("stale"));
+    }
+
+    #[test]
+    fn test_build_resolution_data() {
+        let source = TrafficData {
+            namespace: "default".to_string(),
+            timestamp: "2025-01-01 00:00:00".to_string(),
+            timestamp_ms: 1_735_689_600_000,
+            interfaces: Vec::new(),
+            resolution: None,
+        };
+
+        let data = build_resolution_data(&source, "10s");
+
+        assert_eq!(data.resolution.as_deref(), Some("10s"));
+        assert_eq!(data.namespace, source.namespace);
+        assert_eq!(data.timestamp_ms, source.timestamp_ms);
     }
 
     #[test]

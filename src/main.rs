@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
 
     // 服务器关闭后停止采集器
     log::info!("Stopping traffic collector...");
-    if let Err(e) = collector.stop() {
+    if let Err(e) = collector.shutdown().await {
         log::error!("Failed to stop collector: {}", e);
     } else {
         log::info!("Traffic collector stopped");
