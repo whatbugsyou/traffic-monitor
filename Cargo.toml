@@ -37,10 +37,7 @@ thiserror = "1.0"
 
 # System utilities
 libc = "0.2"
-nix = { version = "0.27", features = ["net", "sched"] }
 
-# Command execution
-which = "5.0"
 
 [profile.release]
 opt-level = 3
